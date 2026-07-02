@@ -13,6 +13,7 @@ class TestCuOptFlow(unittest.TestCase):
         self.assertIn("cuopt_input", result)
         self.assertIn("cuopt_output", result)
         self.assertIn("mission_plan", result)
+        self.assertIn("cbs_output", result)
 
         cuopt_input = result["cuopt_input"]
         cuopt_output = result["cuopt_output"]
@@ -32,6 +33,8 @@ class TestCuOptFlow(unittest.TestCase):
 
         self.assertEqual(mission_plan["status"], "success")
         self.assertIn("forklift_1", mission_plan["vehicle_commands"])
+        self.assertEqual(result["cbs_output"]["status"], "success")
+        self.assertIsNone(result["cbs_output"]["unresolved_conflict"])
 
     def test_single_forklift_scenario(self) -> None:
         result = run_demo_pipeline(scenario="single_forklift")
@@ -50,6 +53,8 @@ class TestCuOptFlow(unittest.TestCase):
         self.assertEqual(result["cuopt_input"]["objective"], "min_makespan")
         self.assertIn("execution_report", result)
         self.assertIn("events", result["execution_report"])
+        self.assertIn("cbs_output", result)
+        self.assertIn("conflicts_resolved", result["cbs_output"])
         self.assertGreater(len(result["cuopt_input"]["jobs"]), 3)
         self.assertIn(result["execution_report"]["status"], ["ok", "degraded", "failed"])
 

@@ -9,7 +9,7 @@ its USD attributes (navPalletToPickId, navAreaToDrop, navGoToPick, etc.).
 
 Requires:
     pip install openai
-    export NVIDIA_API_KEY=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>
+    export NVIDIA_API_KEY=<your key from https://build.nvidia.com>
 
 Quick test:
     python llm_task_parser.py
@@ -96,7 +96,7 @@ RULES:
 # ── NIM client ─────────────────────────────────────────────────────────────
 
 def _get_client() -> OpenAI:
-    api_key = os.environ.get("NVIDIA_API_KEY", "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")
+    api_key = os.environ.get("NVIDIA_API_KEY", "")
     if not api_key:
         raise EnvironmentError(
             "NVIDIA_API_KEY is not set.\n"

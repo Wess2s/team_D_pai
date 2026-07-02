@@ -6,6 +6,7 @@ from collections import defaultdict
 def render_route_summary(result: dict) -> str:
     cuopt_output = result.get("cuopt_output", {})
     execution_report = result.get("execution_report", {})
+    cbs_output = result.get("cbs_output", {})
     lines = [
         f"Scenario: {result.get('scenario', 'n/a')}",
         f"Solver: {cuopt_output.get('solver_name', 'n/a')}",
@@ -46,6 +47,16 @@ def render_route_summary(result: dict) -> str:
                     f"{event.get('event_type', 'event')} "
                     f"[{event.get('severity', 'info')}]"
                 )
+
+    if cbs_output:
+        lines.append("")
+        lines.append(
+            "CBS: "
+            f"status={cbs_output.get('status', 'n/a')} "
+            f"conflicts_resolved={cbs_output.get('conflicts_resolved', 0)}"
+        )
+        if cbs_output.get("unresolved_conflict"):
+            lines.append(f"- unresolved_conflict={cbs_output.get('unresolved_conflict')}")
 
     return "\n".join(lines)
 
