@@ -1,4 +1,3 @@
-cat > sim_bridge.py << 'EOF'
 """
 sim_bridge.py
 -------------
@@ -34,7 +33,6 @@ import textwrap
 from dataclasses import asdict
 
 import socket
-import json
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -308,4 +306,3 @@ if __name__ == "__main__":
             result = dispatch_task(task)
             status = "OK" if result["ok"] else "FAIL"
             print(f"  Result : [{status}] {result['message'][:120]}")
-EOF

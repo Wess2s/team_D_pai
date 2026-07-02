@@ -1,5 +1,3 @@
-cat > llm_task_parser.py << 'EOF'
-
 """
 llm_task_parser.py
 ------------------
@@ -205,4 +203,3 @@ if __name__ == "__main__":
             break
         except Exception as exc:
             print(f"  ERROR: {exc}")
-EOF
