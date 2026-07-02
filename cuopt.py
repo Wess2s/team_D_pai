@@ -4,11 +4,14 @@ import json
 from dataclasses import asdict
 from typing import Literal
 
+from cbs_planner import CBSConfig, plan_checkpoint_cbs
 from cuopt_adapter import MockCuOptAdapter, build_cuopt_input
 from factory_simulator import simulate_factory_execution
 from isaac_scene_extractor import build_mock_warehouse_snapshot, snapshot_to_graph_nodes
 from logistics_models import CuOptConstraints, Job, Vehicle
 from mission_translator import translate_solution_to_mission
+from planner import run_planner_loop
+from runtime_config import load_runtime_config
 from warehouse_graph import build_warehouse_graph
 
 
@@ -138,6 +141,31 @@ def _build_constraints(scenario: ScenarioName) -> CuOptConstraints:
 	return constraints
 
 
+def _build_human_occupancy(scenario: ScenarioName) -> dict[str, list[tuple[int, int]]]:
+	if scenario == "factory_realistic":
+		return {
+			"Dock_01": [(35, 70), (120, 145)],
+			"Dock_02": [(65, 90)],
+			"Waypoint_01": [(80, 110)],
+		}
+	return {
+		"Dock_01": [(45, 55)],
+	}
+
+
+def _build_checkpoints_from_solution(solution_dict: dict) -> dict[str, list[str]]:
+	checkpoints: dict[str, list[str]] = {}
+	for route in solution_dict.get("vehicle_routes", []):
+		vehicle_id = route.get("vehicle_id", "")
+		if not vehicle_id:
+			continue
+		stops = route.get("stops", [])
+		ordered_nodes = [stop.get("node_id", "") for stop in stops if stop.get("node_id")]
+		if ordered_nodes:
+			checkpoints[vehicle_id] = ordered_nodes
+	return checkpoints
+
+
 def run_demo_pipeline(scenario: ScenarioName = "dual_forklift") -> dict:
 	snapshot = build_mock_warehouse_snapshot()
 	nodes = snapshot_to_graph_nodes(snapshot)
@@ -162,7 +190,36 @@ def run_demo_pipeline(scenario: ScenarioName = "dual_forklift") -> dict:
 		nodes=nodes,
 		solution=solution,
 	)
+
+	human_occupancy = _build_human_occupancy(scenario)
+	checkpoints = _build_checkpoints_from_solution(solution.to_dict())
+	cbs_result = plan_checkpoint_cbs(
+		checkpoints=checkpoints,
+		node_index=graph.node_index,
+		cost_matrix=graph.distance_matrix,
+		blocked_nodes=cuopt_input.constraints.blocked_nodes,
+		blocked_edges=cuopt_input.constraints.blocked_edges,
+		human_occupancy=human_occupancy,
+		config=CBSConfig(
+			max_neighbors=4,
+			max_time_steps=300,
+			goal_hold_steps=2,
+			max_expansions=500,
+		),
+	)
+
 	execution = simulate_factory_execution(mission)
+
+	runtime_cfg = load_runtime_config()
+	planner_loop = run_planner_loop(
+		config=runtime_cfg,
+		cuopt_input=cuopt_input,
+		nodes=nodes,
+		node_index=graph.node_index,
+		cost_matrix=graph.distance_matrix,
+		human_occupancy=human_occupancy,
+		mission_id=f"mission_hackathon_{scenario}",
+	)
 
 	return {
 		"scenario": scenario,
@@ -174,8 +231,11 @@ def run_demo_pipeline(scenario: ScenarioName = "dual_forklift") -> dict:
 		},
 		"cuopt_input": cuopt_input.to_dict(),
 		"cuopt_output": solution.to_dict(),
+		"human_occupancy": human_occupancy,
+		"cbs_output": cbs_result,
 		"mission_plan": mission.to_dict(),
 		"execution_report": execution.to_dict(),
+		"planner_loop": planner_loop,
 	}
 
 
