@@ -7,7 +7,7 @@ set -euo pipefail
 
 PUBLIC_IP="${PUBLIC_IP:-100.104.13.18}"
 IMAGE="nvcr.io/nvidia/isaac-sim:6.0.1"
-PROJ="$HOME/nvidia-hackathon"
+PROJ="$HOME/team_D_pai"
 # cuOpt self-hosted REST server (same host, --network=host) so the in-process planner
 # always uses NVIDIA cuOpt — never the local fallback. Override with CUOPT_URL=... .
 CUOPT_URL="${CUOPT_URL:-http://localhost:5000}"

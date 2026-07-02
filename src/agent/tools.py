@@ -189,11 +189,27 @@ def _plan_and_dispatch(br, snap: dict, pallets: list[str] | None,
                            "tasks": [f"{p}→{z}" for p, z in tasks],
                            "ok": res.get("ok", True)})
 
+    # Battery care: any idle forklift that wasn't given work AND is low on charge is sent
+    # to its home charger to top up (cuOpt already declined to route it because its
+    # remaining range couldn't cover the job — this is the "swap to the fuller truck and
+    # recharge the low one" behaviour). go_home is a no-op if it's already home.
+    recharging = []
+    for fk, f in snap.get("forklifts", {}).items():
+        if fk in routes or f.get("carrying"):
+            continue
+        if f.get("phase") != "idle":
+            continue
+        if f.get("battery", 100.0) >= cuopt_planner.LOW_BATTERY:
+            continue
+        br.go_home(fk)
+        recharging.append(fk)
+
     LAST_PLAN = {
         "solver": plan.solver,
         "total_cost": plan.total_cost,
         "assignments": {fk: [f"{p}→{z}" for p, z in tasks]
                         for fk, tasks in routes.items()},
+        "recharging": recharging,
         "cbs": {"conflicts_found": cbs_res.conflicts_found,
                 "resolved": cbs_res.resolved,
                 "paths": cbs_res.paths},
@@ -203,6 +219,7 @@ def _plan_and_dispatch(br, snap: dict, pallets: list[str] | None,
         "solver": plan.solver,
         "total_cost": plan.total_cost,
         "dispatched": dispatched,
+        "recharging": recharging,
         "cbs": {"conflicts_found": cbs_res.conflicts_found, "resolved": cbs_res.resolved},
     })
 

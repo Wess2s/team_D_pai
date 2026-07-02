@@ -30,10 +30,13 @@ except Exception:  # requests optional off-DGX
 # Battery model (mirrors scenes/scene_exec.py). A truck spends BATTERY_DRAIN_PER_M % of
 # charge per metre, so its remaining travel range in metres is battery% * RANGE_PER_PCT.
 # cuOpt uses that as each vehicle's max route cost, and penalises low charge so the fuller
-# truck is preferred — i.e. it optimises travel cost AND preserves fleet battery.
-BATTERY_RANGE_PER_PCT = 2.0     # metres of range per 1% charge (== 1 / 0.5%/m)
-BATTERY_PREF_WEIGHT   = 0.2     # fixed-cost penalty per 1% of missing charge
-LOW_BATTERY           = 15.0    # below this a truck is held back to recharge
+# truck is preferred — i.e. it optimises travel cost AND preserves fleet battery. The
+# steep drain (0.25 m per 1%, == 4%/m in the sim) makes charge decisive: a partly-used
+# truck is genuinely out-ranged by a full one, so cuOpt swaps to the fuller truck and the
+# low one is sent to charge.
+BATTERY_RANGE_PER_PCT = 0.25    # metres of range per 1% charge (== 1 / 4%/m)
+BATTERY_PREF_WEIGHT   = 0.4     # fixed-cost penalty per 1% of missing charge
+LOW_BATTERY           = 40.0    # below this a truck is held back and sent to recharge
 
 
 @dataclass

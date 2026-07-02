@@ -49,6 +49,14 @@ def _solver_label(solver: str | None) -> str:
     return "cuOpt"
 
 
+def _recharge_note(data: dict) -> str:
+    """Trailing clause naming any low-battery trucks routed to their charger."""
+    rc = data.get("recharging") or []
+    if not rc:
+        return ""
+    return f"; {', '.join(rc)} sent to charge (low battery)"
+
+
 def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
     """Build a short operator-facing summary from executed offline steps."""
     if not results:
@@ -70,7 +78,8 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
                     f"{_solver_label(data.get('solver'))} routed {asg or kwargs.get('pallet')}, "
                     f"cost {data.get('total_cost')}; CBS checked "
                     f"{cbsd.get('conflicts_found', 0)} conflict(s), "
-                    f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}")
+                    f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}"
+                    + _recharge_note(data))
         elif name == "optimize_and_dispatch":
             data = json.loads(out)
             if not data.get("ok"):
@@ -82,7 +91,8 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
                     f"{_solver_label(data.get('solver'))} assigned {n} forklift(s), "
                     f"tour cost {data.get('total_cost')}; CBS checked "
                     f"{cbsd.get('conflicts_found', 0)} conflict(s), "
-                    f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}")
+                    f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}"
+                    + _recharge_note(data))
         elif name == "plan_routes":
             data = json.loads(out)
             if not data.get("ok"):

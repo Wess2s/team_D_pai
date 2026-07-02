@@ -109,10 +109,12 @@ TURN_RATE     = math.radians(140.0) # rad/s max yaw slew toward travel heading
 # sits idle at (near) its home charger it trickles back up. cuOpt reads the live % from
 # the snapshot and (a) won't route a truck past its remaining range and (b) prefers the
 # more-charged truck — see cuopt_planner. BATTERY_DRAIN_PER_M must match the planner's
-# BATTERY_RANGE_PER_PCT (range = battery / drain).
+# BATTERY_RANGE_PER_PCT (range = battery / drain). Drain is deliberately steep so the
+# fleet's charge visibly matters — a partly-used truck can be out-ranged by a full one,
+# which is what makes cuOpt's battery-aware selection demonstrable.
 BATTERY_FULL         = 100.0
-BATTERY_DRAIN_PER_M  = 0.5          # % of charge spent per metre driven
-BATTERY_CHARGE_PER_S = 4.0          # % regained per second while idle on the charger
+BATTERY_DRAIN_PER_M  = 4.0          # % of charge spent per metre driven (steep, for demo)
+BATTERY_CHARGE_PER_S = 10.0         # % regained per second while idle on the charger
 BATTERY_CHARGE_RADIUS = 1.5         # m from home within which charging happens
 # The rigged model's visual forward (fork direction) is offset from the articulation
 # root's reported yaw. We orient the truck by setting root_yaw = travel - MODEL_YAW_OFFSET

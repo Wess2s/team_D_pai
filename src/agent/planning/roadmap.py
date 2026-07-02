@@ -28,7 +28,8 @@ class Roadmap:
     # ---- construction ---------------------------------------------------- #
     @classmethod
     def from_snapshot(cls, snap: dict, cell: float = 2.0, margin: float = 2.0,
-                      grid: tuple[int, int] | None = None) -> "Roadmap":
+                      grid: tuple[int, int] | None = None,
+                      zone_clear: float = 1.3) -> "Roadmap":
         """Adopt the snapshot's graph if present, else synthesise a grid.
 
         Nodes whose id starts with ``rack`` are warehouse obstacles (the mock exposes them
@@ -36,6 +37,9 @@ class Roadmap:
         through a rack. When ``grid=(nx, ny)`` is given (and the snapshot has no graph of
         its own), a fixed ``nx × ny`` uniform mesh is laid over the floor instead of a
         cell-sized grid — this is what the live Isaac scene uses for its 20×20 waypoint map.
+        ``zone_clear`` is the radius (m) around each staging/loading zone whose grid cells
+        are punched out so through-traffic never cuts across a loading area (a delivering
+        truck still reaches it — the bridge appends the exact goal + standoff run-in).
         """
         g = snap.get("graph") or {}
         gnodes = g.get("nodes") or {}
@@ -49,7 +53,7 @@ class Roadmap:
                     edges[b].add(a)
             return cls(nodes, edges)
         if grid is not None:
-            return cls._uniform_grid(snap, grid[0], grid[1], margin)
+            return cls._uniform_grid(snap, grid[0], grid[1], margin, zone_clear)
         return cls._synthesise_grid(snap, cell, margin)
 
     @staticmethod
@@ -68,12 +72,15 @@ class Roadmap:
         return (min(xs) - margin, max(xs) + margin, min(ys) - margin, max(ys) + margin)
 
     @classmethod
-    def _uniform_grid(cls, snap: dict, nx: int, ny: int, margin: float) -> "Roadmap":
+    def _uniform_grid(cls, snap: dict, nx: int, ny: int, margin: float,
+                      zone_clear: float = 1.3) -> "Roadmap":
         """A fixed ``nx × ny`` 4-connected mesh spanning the floor bounding box.
 
         Cells nearest a resting pallet are punched out so routes naturally arc around
-        loaded rack faces; the fine spacing (vs. the old 1 m grid) gives the trucks a much
-        smoother, more legible trajectory and denser on-map waypoint markers.
+        loaded rack faces, and cells within ``zone_clear`` of a staging/loading zone are
+        removed so through-traffic never cuts across a loading area. The fine spacing (vs.
+        the old 1 m grid) gives the trucks a much smoother, more legible trajectory and
+        denser on-map waypoint markers.
         """
         nx, ny = max(2, nx), max(2, ny)
         min_x, max_x, min_y, max_y = cls._floor_bounds(snap, margin)
@@ -91,12 +98,20 @@ class Roadmap:
                 continue
             blocked_cells.add(cell_of(p["x"], p["y"]))
 
+        zone_pts = [(z["x"], z["y"]) for z in snap.get("zones", {}).values()]
+
+        def in_loading_area(x: float, y: float) -> bool:
+            return any(math.hypot(x - zx, y - zy) <= zone_clear for zx, zy in zone_pts)
+
         nodes: dict[str, Coord] = {}
         for c in range(nx):
             for r in range(ny):
                 if (c, r) in blocked_cells:
                     continue
-                nodes[f"g{c}_{r}"] = (min_x + c * step_x, min_y + r * step_y)
+                x, y = (min_x + c * step_x, min_y + r * step_y)
+                if in_loading_area(x, y):
+                    continue
+                nodes[f"g{c}_{r}"] = (x, y)
 
         edges: dict[str, set[str]] = {n: set() for n in nodes}
         for c in range(nx):
