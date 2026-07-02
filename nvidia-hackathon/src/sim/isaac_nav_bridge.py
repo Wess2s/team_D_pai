@@ -58,6 +58,11 @@ CHARGERS = {
     "charge_1": (-6.0, -3.0),
     "charge_2": (6.0, 3.0),
 }
+# Battery model computed bridge-side (independent of the scene controller): drains
+# with distance driven between /state polls, recharges while parked on a charger.
+BATTERY_DRAIN_PER_M = 0.6         # % per metre driven
+BATTERY_CHARGE_PER_POLL = 0.4     # % per /state poll while docked idle
+CHARGER_RADIUS = 1.8              # m
 
 # Densify every route into short, evenly-spaced waypoints so the truck tracks the
 # planned line tightly (instead of arcing between far-apart grid nodes) and gets a
@@ -77,6 +82,8 @@ class IsaacNavBackend:
 
     def __init__(self) -> None:
         self.bus = bus()
+        self._battery = {name: 100.0 for name in FORKLIFTS}
+        self._bat_last: dict[str, tuple[float, float]] = {}
 
         # Register forklifts + pallets + zones on the shared bus.
         for name, (x, y, yaw) in FORKLIFTS.items():
@@ -299,6 +306,24 @@ class IsaacNavBackend:
         return {"ok": True, "blocked": zone_id}
 
     # ---- snapshot ------------------------------------------------------- #
+    def _update_battery(self, name: str, t) -> float:
+        """Drain with distance driven since the last poll; recharge while parked on a
+        charger. Computed here so it survives regardless of the scene controller."""
+        b = self._battery.get(name, 100.0)
+        last = self._bat_last.get(name)
+        self._bat_last[name] = (t.x, t.y)
+        if last is not None:
+            moved = math.hypot(t.x - last[0], t.y - last[1])
+            if moved > 1e-3:
+                b -= moved * BATTERY_DRAIN_PER_M
+            elif t.phase in ("idle", "returning"):
+                near = min((math.hypot(t.x - cx, t.y - cy) for (cx, cy) in CHARGERS.values()), default=1e9)
+                if near < CHARGER_RADIUS:
+                    b += BATTERY_CHARGE_PER_POLL
+        b = max(0.0, min(100.0, b))
+        self._battery[name] = b
+        return round(b, 1)
+
     def snapshot(self) -> dict:
         forklifts = {}
         for name in FORKLIFTS:
@@ -311,7 +336,7 @@ class IsaacNavBackend:
                 "object_detected": t.object_detected,
                 "object_distance": round(t.object_distance, 3),
                 "path_blocked": bool(t.path_blocked),
-                "battery": round(getattr(t, "battery", 100.0), 1),
+                "battery": self._update_battery(name, t),
             }
         pallets = {pid: {"x": round(p["x"], 3), "y": round(p["y"], 3),
                          "carried_by": p.get("carried_by"), "delivered": bool(p.get("delivered"))}
