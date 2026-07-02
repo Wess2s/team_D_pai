@@ -1,1 +1,0 @@
-"""nvidia-hackathon source package."""
