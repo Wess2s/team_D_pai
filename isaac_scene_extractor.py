@@ -20,6 +20,72 @@ class IsaacSceneSnapshot:
     entities: list[IsaacEntity]
 
 
+def extract_from_state_snapshot(state: dict[str, Any]) -> IsaacSceneSnapshot:
+    """Extract entities from a live FleetMind ``GET /state`` snapshot.
+
+    This is the *real-environment* counterpart to :func:`extract_from_isaac_stage`.
+    The deployed scene is not reachable via direct USD traversal from off-DGX, but
+    the HTTP bridge exposes the same ground truth (forklift poses, pallet poses +
+    carry/delivery flags, staging-zone poses + blocked flag, and the nav graph).
+    Every entity keeps its real scene id so missions dispatch back with no name
+    translation.
+
+    Kinds produced: ``forklift``, ``pallet``, ``dock`` (staging zone),
+    ``waypoint`` (nav-graph node). Charging nodes are not present in this scene
+    and must be supplied via config (see env_config.VehicleDefaults.charging_xy).
+    """
+    entities: list[IsaacEntity] = []
+
+    for fid, info in (state.get("forklifts") or {}).items():
+        entities.append(
+            IsaacEntity(
+                entity_id=str(fid),
+                kind="forklift",
+                x=float(info.get("x", 0.0)),
+                y=float(info.get("y", 0.0)),
+                metadata={
+                    "phase": info.get("phase", "idle"),
+                    "carrying": info.get("carrying"),
+                    "yaw": info.get("yaw", 0.0),
+                    "path_blocked": info.get("path_blocked", False),
+                    "object_detected": info.get("object_detected"),
+                },
+            )
+        )
+
+    for pid, info in (state.get("pallets") or {}).items():
+        entities.append(
+            IsaacEntity(
+                entity_id=str(pid),
+                kind="pallet",
+                x=float(info.get("x", 0.0)),
+                y=float(info.get("y", 0.0)),
+                metadata={
+                    "carried_by": info.get("carried_by"),
+                    "delivered": info.get("delivered", False),
+                },
+            )
+        )
+
+    for zid, info in (state.get("zones") or {}).items():
+        entities.append(
+            IsaacEntity(
+                entity_id=str(zid),
+                kind="dock",
+                x=float(info.get("x", 0.0)),
+                y=float(info.get("y", 0.0)),
+                metadata={"blocked": info.get("blocked", False)},
+            )
+        )
+
+    for nid, xy in ((state.get("graph") or {}).get("nodes") or {}).items():
+        entities.append(
+            IsaacEntity(entity_id=str(nid), kind="waypoint", x=float(xy[0]), y=float(xy[1]))
+        )
+
+    return IsaacSceneSnapshot(entities=entities)
+
+
 def extract_from_isaac_stage(stage: Any) -> IsaacSceneSnapshot:
     """Extract relevant entities from an Isaac Sim stage.
 

@@ -1,0 +1,50 @@
+{
+  "base_url": "http://localhost:8080",
+  "http_timeout_s": 10.0,
+
+  "naming": {
+    "forklift_prefix": "AMR_",
+    "pallet_prefix": "WH_Palette_",
+    "zone_prefix": "stage_",
+    "pallet_prim_template": "/World/Pallets/Pallet_{index:02d}",
+    "forklift_prim_template": "/World/AMRs/{forklift_id}",
+    "zone_prim_template": "/World/Zones/{zone_id}"
+  },
+
+  "graph": {
+    "use_nav_graph": true,
+    "attach_strategy": "nearest",
+    "fallback_to_euclidean": true
+  },
+
+  "vehicles": {
+    "speed_mps": 1.2,
+    "capacity": 1.0,
+    "battery_level_pct": 100.0,
+    "energy_per_meter_pct": 0.0,
+    "min_battery_reserve_pct": 15.0,
+    "charging_xy": [0.0, 0.0]
+  },
+
+  "jobs": {
+    "strategy": "round_robin"
+  },
+
+  "cuopt": {
+    "endpoint_env": "CUOPT_URL",
+    "api_key_env": "CUOPT_API_KEY",
+    "objective": "min_distance",
+    "timeout_s": 30.0
+  },
+
+  "cbs": {
+    "enabled": true,
+    "max_expansions": 500
+  },
+
+  "replan": {
+    "enabled": true,
+    "triggers": ["path_blocked", "object_detected", "conflict", "pallet_moved", "low_battery"],
+    "low_battery_pct": 20.0
+  }
+}
