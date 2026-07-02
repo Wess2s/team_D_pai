@@ -1,6 +1,9 @@
-# team_D_pai
+# team_D_pai — Geo-CBS Fleet Orchestrator
 
-## Isaac Sim -> cuOpt Integration (Hackathon MVP)
+Natural-language control of an NVIDIA **Isaac Sim** forklift simulation. An operator
+types a plain-English command (e.g. *"move blockpallet_a09 one metre to the left"*),
+an LLM converts it into structured robot tasks, and those tasks are pushed into a
+running Isaac Sim instance where they drive a forklift robot via USD attributes.
 
 This repository now contains a minimum but extensible pipeline for logistics planning:
 
@@ -99,49 +102,65 @@ Isaac Sim remains the source of physical truth and visualization, but cuOpt rece
 - `cuopt.py`
   - orchestrates full mock E2E flow and prints traceable JSON
 
-- `test_cuopt_flow.py`
-  - minimum end-to-end test
+## Repository layout
 
-## cuOpt Input Contract
+| File | Description |
+| --- | --- |
+| [llm_task_parser.py](llm_task_parser.py) | **Step 1.** Converts a natural-language command into a list of structured `RobotTask` objects using an NVIDIA NIM-hosted LLM (`meta/llama-3.1-8b-instruct`). Defines the task schema and the system prompt that enumerates valid robots, pallets, and drop areas. |
+| [sim_bridge.py](sim_bridge.py) | **Step 2.** Translates each `RobotTask` into a Python snippet that sets USD attributes on the forklift prim, then sends it to a running Isaac Sim over a TCP socket (`localhost:8765`). |
+| [serveractivation.py](serveractivation.py) | **Receiver.** The one-time snippet you paste into Isaac Sim's *Script Editor*. It starts a TCP server on port `8765` inside Isaac Sim's Python process and `exec()`s incoming scripts on the main thread. |
+| [forklift.usd](forklift.usd) | USD (binary crate) asset for the forklift robot. |
+| [omniverse3_0.usd](omniverse3_0.usd) | USD (binary crate) scene/stage. |
+| README.md | This document. |
 
-`CuOptInput` includes:
+## How it works
 
-- `nodes`: id, node_type, physical coordinates
-- `node_index`: mapping `node_id -> matrix_index`
-- `cost_matrix`: travel cost or distance matrix
-- `vehicles`: start node, capacity, charging node
-- `jobs`: pickup, delivery, priority, demand, service time
-- `jobs` time windows: pickup and delivery allowed intervals
-- `constraints`: basic constraints placeholder
-- `constraints` advanced: blocked edges/nodes, occupancy buffer, max route time
-- `objective`: `min_distance`, `min_time`, or `min_makespan`
+1. **Parse** — `parse_command(text)` in [llm_task_parser.py](llm_task_parser.py) sends the
+   operator's command to the LLM and returns a list of `RobotTask` dataclasses.
+2. **Dispatch** — `dispatch_task(task)` in [sim_bridge.py](sim_bridge.py) builds a USD-manipulation
+   script for the task's action and sends it over TCP to Isaac Sim.
+3. **Execute** — the receiver from [serveractivation.py](serveractivation.py), running inside
+   Isaac Sim, executes the script on the main thread, setting navigation attributes on the
+   `/World/forklift` prim.
+4. **Drive** — the forklift behaviour (running inside the sim) reads those attributes each
+   frame and moves the robot.
 
-## cuOpt Output Contract
+### RobotTask schema
 
-`CuOptOutput` includes:
+Defined in [llm_task_parser.py](llm_task_parser.py):
 
-- `status`: `success` or `error`
-- `vehicle_routes`: per-vehicle route with ordered stops
-- `assigned_job_ids`: job assignment traceability
-- `total_cost`: total objective cost
-- `errors`: diagnostics
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `action` | `pick` \| `drop` \| `move` \| `go_home` \| `stop` | What the forklift should do |
+| `robot_id` | str | Forklift prim name (e.g. `forklift_b_sensor`) |
+| `pallet_id` | str | Pallet to pick (e.g. `blockpallet_a09`) |
+| `drop_area_id` | str | Named drop destination (e.g. `Buffer_A`, `Rack_01`) |
+| `offset_x` | float | Metres along world X (+ right/east, − left/west) |
+| `offset_y` | float | Metres along world Y (+ forward/north, − back/south) |
+| `notes` | str | LLM explanation or ambiguity note |
 
-## Mission Translation
+### Known stage identifiers
 
-`mission_translator.py` converts logical route stops into commands that a planner/controller/UI can execute:
+- **Robots:** `forklift_b_sensor`
+- **Pallets:** `blockpallet_b02`, `blockpallet_a06`, `blockpallet_c01`, `blockpallet_a09`
+- **Drop areas:** `Buffer_A`, `Buffer_B`, `Rack_01`, `Rack_02`, `Dock_01`
 
-- `navigate` to physical waypoint/zone
-- `pickup` pallet at storage
-- `dropoff` pallet at dock/target
-- `charge` at charging node
+## Prerequisites
 
-These commands can be consumed by:
+- NVIDIA Isaac Sim (tested with the `nvcr.io/nvidia/isaac-sim:6.0.1` container).
+- Python 3.10+ with the OpenAI client:
+  ```bash
+  pip install openai
+  ```
+- An NVIDIA API key for NVIDIA NIM (build.nvidia.com), exported as an environment variable:
+  ```bash
+  export NVIDIA_API_KEY='nvapi-...'
+  ```
 
-- a forklift controller
-- existing Isaac Sim bridge scripts
-- a mission visualization UI
+> **Security:** do not commit API keys to source. Read the key from `NVIDIA_API_KEY`
+> only, and rotate any key that has ever been hardcoded or shared.
 
-## Factory-Grade Enhancements Included
+## Usage
 
 - collision-aware temporal scheduling via node reservation windows
 - CBS conflict resolution for multi-forklift path synchronization
@@ -179,52 +198,42 @@ These commands can be consumed by:
 
 ## Run Demo
 
-```bash
-python cuopt.py
+```
+[SimBridge] Listening on 8765
+[SimBridge] Server started
 ```
 
-This prints a full JSON payload containing:
+### 2. Send a command from your host
 
-- extracted/mock scene snapshot
-- warehouse graph and distance matrix
-- generated cuOpt input
-- mock cuOpt solution
-- final mission plan ready for Isaac/UI integration
+```python
+from llm_task_parser import parse_command
+from sim_bridge import dispatch_task
 
-## Quick Visual Demo (Recommended)
-
-Run all scenarios with a simple ASCII map and route summary:
-
-```bash
-python demo_runner.py --scenario all
+tasks = parse_command("move blockpallet_a09 one metre to the left")
+for t in tasks:
+    print(dispatch_task(t))
 ```
 
-Run one scenario:
+### 3. Run the built-in tests
 
 ```bash
-python demo_runner.py --scenario single_forklift
-python demo_runner.py --scenario dual_forklift
-python demo_runner.py --scenario urgent_jobs
-python demo_runner.py --scenario factory_realistic
+# Parser only (needs NVIDIA_API_KEY)
+python llm_task_parser.py
+
+# End-to-end dispatch (needs the receiver running in Isaac Sim)
+python sim_bridge.py
 ```
 
-Save JSON outputs for each scenario:
+## Configuration
 
-```bash
-python demo_runner.py --scenario all --json-out demo_outputs
-```
+`sim_bridge.py` exposes these constants at the top of the file:
 
-Disable map rendering if you only want textual summary:
-
-```bash
-python demo_runner.py --scenario all --no-map
-```
-
-## Run Tests
-
-```bash
-python -m unittest -v
-```
+| Constant | Default | Purpose |
+| --- | --- | --- |
+| `ISAAC_SIM_HOST` | `localhost` | Host running Isaac Sim (change for a remote sim) |
+| `ISAAC_SIM_PORT` | `8765` | TCP port of the in-sim receiver |
+| `FORKLIFT_PATH` | `/World/forklift` | USD path of the forklift prim |
+| `TIMEOUT_S` | `10` | Socket timeout in seconds |
 
 Run CBS-focused tests only:
 

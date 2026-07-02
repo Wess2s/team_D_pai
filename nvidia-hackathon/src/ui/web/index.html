@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FleetMind · Fleet Orchestrator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+
+    <!-- ── Command bar ─────────────────────────────────────────── -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">F</div>
+        <div class="brand-text">
+          <div class="brand-title">FleetMind <span>Fleet Orchestrator</span></div>
+          <div class="brand-sub">Geo-CBS multi-forklift coordination · natural-language control</div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="status-pill" id="statusPill">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">CONNECTING…</span>
+        </div>
+        <div class="clock" id="clock">--:--:--</div>
+      </div>
+    </header>
+
+    <!-- ── KPI strip ───────────────────────────────────────────── -->
+    <section class="kpis" id="kpis">
+      <div class="kpi" data-k="delivered">
+        <div class="kpi-val" id="kpiDelivered">0</div>
+        <div class="kpi-label">Delivered</div>
+        <canvas class="kpi-spark" id="sparkDelivered" width="120" height="26"></canvas>
+      </div>
+      <div class="kpi" data-k="transit">
+        <div class="kpi-val" id="kpiTransit">0</div>
+        <div class="kpi-label">In transit</div>
+      </div>
+      <div class="kpi" data-k="waiting">
+        <div class="kpi-val" id="kpiWaiting">0</div>
+        <div class="kpi-label">Awaiting pickup</div>
+      </div>
+      <div class="kpi" data-k="active">
+        <div class="kpi-val" id="kpiActive">0</div>
+        <div class="kpi-label">Active forklifts</div>
+      </div>
+      <div class="kpi" data-k="throughput">
+        <div class="kpi-val" id="kpiThroughput">0<span class="unit">%</span></div>
+        <div class="kpi-label">Throughput</div>
+        <canvas class="kpi-spark" id="sparkThroughput" width="120" height="26"></canvas>
+      </div>
+      <div class="kpi" data-k="clock">
+        <div class="kpi-val" id="kpiSim">0<span class="unit">s</span></div>
+        <div class="kpi-label">Sim clock</div>
+      </div>
+    </section>
+
+    <!-- ── Main 3-column mission control ───────────────────────── -->
+    <main class="grid">
+
+      <!-- Left: fleet roster -->
+      <aside class="panel rail-left">
+        <div class="panel-head">
+          <span>Fleet roster</span>
+          <span class="panel-badge" id="rosterCount">0</span>
+        </div>
+        <div class="roster" id="roster"></div>
+
+        <div class="plan-panel" id="planPanel">
+          <div class="panel-head sub">
+            <span>cuOpt · CBS plan</span>
+            <span class="panel-badge">optimiser</span>
+          </div>
+          <div class="plan-body" id="planBody">
+            <div class="plan-empty">No active plan. Ask the agent to optimise the fleet.</div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center: live map / live 3D stream -->
+      <section class="panel stage" id="stage" data-view="map">
+        <div class="panel-head floating">
+          <span id="stageTitle">Live warehouse map</span>
+          <div class="stage-controls">
+            <div class="view-toggle" id="viewToggle">
+              <button type="button" class="vt-btn active" data-view="map">Map</button>
+              <button type="button" class="vt-btn" data-view="stream">Live 3D</button>
+            </div>
+            <span class="live-tag"><span class="dot"></span>LIVE</span>
+          </div>
+        </div>
+
+        <!-- 2D canvas map -->
+        <canvas id="map"></canvas>
+        <div class="legend" id="legend"></div>
+        <div class="scanline"></div>
+
+        <!-- WebRTC 3D stream (Isaac Sim viewport) -->
+        <div class="stream-wrap" id="streamWrap">
+          <video id="remote-video" playsinline muted autoplay tabindex="-1"></video>
+          <audio id="remote-audio" muted></audio>
+          <div class="stream-overlay" id="streamOverlay">
+            <div class="stream-status" id="streamStatus">
+              <div class="stream-spinner"></div>
+              <div class="stream-msg" id="streamMsg">Connecting to Isaac Sim stream…</div>
+              <button type="button" class="stream-retry" id="streamRetry" hidden>Reconnect</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right: command + activity -->
+      <aside class="panel rail-right">
+        <div class="panel-head">
+          <span>Fleet command</span>
+          <span class="panel-badge" id="agentMode">agent</span>
+        </div>
+
+        <div class="chat" id="chat">
+          <div class="chat-log" id="chatLog"></div>
+          <div class="chips" id="chips"></div>
+          <form class="chat-input" id="chatForm" autocomplete="off">
+            <input id="chatBox" placeholder="Command the fleet…  e.g. move pallet 1 to stage 1" />
+            <button type="submit" id="chatSend" aria-label="Send">▶</button>
+          </form>
+        </div>
+
+        <div class="activity">
+          <div class="activity-head">Activity feed</div>
+          <div class="activity-log" id="activityLog"></div>
+        </div>
+      </aside>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
