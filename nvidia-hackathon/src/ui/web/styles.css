@@ -226,6 +226,18 @@ body {
 .rc-metric .m-val { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--ink); }
 .rc-metric .m-lab { font-size: 8.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); margin-top: 2px; }
 
+.rc-batt { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.rc-batt-track {
+  flex: 1; height: 7px; border-radius: 999px; overflow: hidden;
+  background: rgba(255,255,255,.08); border: 1px solid var(--line);
+}
+.rc-batt-fill {
+  display: block; height: 100%; width: 100%;
+  background: var(--nv); border-radius: 999px;
+  transition: width .4s ease, background .4s ease;
+}
+.rc-batt-pct { font-family: var(--mono); font-size: 10px; font-weight: 700; min-width: 34px; text-align: right; color: var(--nv); }
+
 /* ── Stage / map ─────────────────────────────────────────────────────── */
 .stage { position: relative; background: radial-gradient(120% 120% at 50% 0%, #0b111a, #070b11 70%); }
 .panel-head.floating {
@@ -269,6 +281,20 @@ body {
 .vt-btn:hover { color: var(--ink); }
 .vt-btn.active {
   color: #06090c;
+  background: linear-gradient(150deg, var(--nv), var(--nv-dim));
+}
+
+.graph-toggle {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--mute);
+  background: rgba(7,11,17,.78); border: 1px solid var(--line);
+  padding: 5px 12px; border-radius: 999px; cursor: pointer;
+  transition: color .18s, background .18s, border-color .18s;
+  backdrop-filter: blur(6px);
+}
+.graph-toggle:hover { color: var(--ink); }
+.graph-toggle.active {
+  color: #06090c; border-color: transparent;
   background: linear-gradient(150deg, var(--nv), var(--nv-dim));
 }
 

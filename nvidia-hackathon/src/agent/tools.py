@@ -59,20 +59,20 @@ def move_pallet(pallet: str, zone: str, robot: str | None = None) -> str:
     """
     Move a pallet to a staging zone with one forklift (pick then drop, chained).
     If `robot` is omitted, the nearest free forklift is chosen automatically.
+
+    Like optimize_and_dispatch, this always runs the full planning stack: NVIDIA cuOpt
+    assigns/orders the move (roadmap-aware VRP) and Conflict-Based Search deconflicts the
+    approach against the rest of the fleet before the mission is dispatched.
     """
     br = _bridge()
     if br is None:
         return json.dumps({"ok": False, "error": "sim bridge unreachable"})
     snap = _snapshot()
-    xy = ws.pallet_xy(snap, pallet)
-    if xy is None:
+    if pallet not in snap.get("pallets", {}):
         return json.dumps({"ok": False, "error": f"unknown pallet {pallet}"})
-    if robot is None:
-        robot = ws.nearest_free_forklift(snap, xy)
-        if robot is None:
-            return json.dumps({"ok": False, "error": "no free forklift available"})
-    res = br.mission(robot, [["pick", pallet], ["drop", zone]])
-    return json.dumps({"robot": robot, "pallet": pallet, "zone": zone, "result": res})
+    if zone not in snap.get("zones", {}):
+        return json.dumps({"ok": False, "error": f"unknown zone {zone}"})
+    return _plan_and_dispatch(br, snap, pallets=[pallet], zones=[zone], force_robot=robot)
 
 
 def pick_pallet(pallet: str, robot: str | None = None) -> str:
@@ -127,32 +127,60 @@ def optimize_and_dispatch(zone: str | None = None) -> str:
     CBS then plans time-parameterised, collision-free approach paths across the fleet.
     Returns the plan (assignments, cost, conflicts found & resolved) and dispatches it.
     """
-    global LAST_PLAN
     br = _bridge()
     if br is None:
         return json.dumps({"ok": False, "error": "sim bridge unreachable"})
     snap = _snapshot()
+    zones = [zone] if zone else None
+    return _plan_and_dispatch(br, snap, pallets=None, zones=zones)
+
+
+def _plan_and_dispatch(br, snap: dict, pallets: list[str] | None,
+                       zones: list[str] | None, force_robot: str | None = None) -> str:
+    """Shared cuOpt (VRP assignment) + CBS (deconfliction) plan-and-dispatch core.
+
+    Every fleet-moving command flows through here so the optimisation + deconfliction
+    stack is *always* exercised — there is no code path that moves a forklift without
+    first running cuOpt and CBS. `pallets`/`zones` scope the job (None = the whole rack);
+    `force_robot` pins a single move onto a specific forklift when the operator named one.
+    """
+    global LAST_PLAN
     rm = Roadmap.from_snapshot(snap)
 
-    zones = [zone] if zone else None
-    plan = cuopt_planner.plan_moves(snap, rm, zones=zones)
-    if not plan.routes:
+    plan = cuopt_planner.plan_moves(snap, rm, pallets=pallets, zones=zones)
+    routes = plan.routes
+
+    # Honour an explicitly named forklift by re-homing the (single) planned tour onto it.
+    if force_robot and routes:
+        merged = [t for tasks in routes.values() for t in tasks]
+        routes = {force_robot: merged}
+
+    if not routes:
         return json.dumps({"ok": False, "error": "nothing to dispatch "
                            "(no free forklift or no pallets awaiting pickup)"})
 
-    # CBS: deconflict each forklift's approach to its first pickup.
+    # CBS: deconflict every dispatched forklift's approach to its first pickup — AND treat
+    # every idle forklift as a stationary obstacle (start == goal) so the moving trucks are
+    # routed around parked ones, not through them. With only one truck moving there would be
+    # no pair to deconflict, so without the idle agents CBS would trivially report zero
+    # conflicts; pinning the parked fleet in place is what makes deconfliction real here.
     agents: dict[str, tuple[str, str]] = {}
-    for fk, tasks in plan.routes.items():
+    for fk, tasks in routes.items():
         f = snap["forklifts"][fk]
         first_pallet = snap["pallets"][tasks[0][0]]
         agents[fk] = (rm.nearest(f["x"], f["y"]),
                       rm.nearest(first_pallet["x"], first_pallet["y"]))
+    for fk, f in snap.get("forklifts", {}).items():
+        if fk in routes:
+            continue
+        node = rm.nearest(f["x"], f["y"])
+        agents[fk] = (node, node)          # parked: holds its node for all time
     cbs_res = cbs.solve(rm, agents)
 
     # Dispatch each forklift's ordered pick→drop tour. Stagger releases if CBS could not
     # fully resolve conflicts within budget (motion stays proactively safe).
     dispatched = []
-    for fk, tasks in plan.routes.items():
+    for fk, tasks in routes.items():
         steps = []
         for pallet, zid in tasks:
             steps += [["pick", pallet], ["drop", zid]]
@@ -165,7 +193,7 @@ def optimize_and_dispatch(zone: str | None = None) -> str:
         "solver": plan.solver,
         "total_cost": plan.total_cost,
         "assignments": {fk: [f"{p}→{z}" for p, z in tasks]
-                        for fk, tasks in plan.routes.items()},
+                        for fk, tasks in routes.items()},
         "cbs": {"conflicts_found": cbs_res.conflicts_found,
                 "resolved": cbs_res.resolved,
                 "paths": cbs_res.paths},
@@ -191,6 +219,11 @@ def plan_routes() -> str:
         f = snap["forklifts"][fk]
         fp = snap["pallets"][tasks[0][0]]
         agents[fk] = (rm.nearest(f["x"], f["y"]), rm.nearest(fp["x"], fp["y"]))
+    for fk, f in snap.get("forklifts", {}).items():
+        if fk in plan.routes:
+            continue
+        node = rm.nearest(f["x"], f["y"])
+        agents[fk] = (node, node)          # parked forklift = stationary obstacle
     cbs_res = cbs.solve(rm, agents)
     return json.dumps({
         "ok": True, "solver": plan.solver, "total_cost": plan.total_cost,

@@ -37,12 +37,12 @@ FORKLIFTS = {
     "AMR_1": (-6.0, -3.0, 0.0),
     "AMR_2": (6.0, 3.0, 180.0),
 }
-# Six pallets on the rack grid. Exposed to the agent/UI under mock-compatible ids
-# (WH_Palette_01..06) mapped to the scene's USD prims (Pallet_00..05) so nothing
-# above the bridge changes.
+# Three pallets on the rack grid (reduced from six to keep the aisles clear for
+# two-forklift navigation). Exposed to the agent/UI under mock-compatible ids
+# (WH_Palette_01..03) mapped to the scene's USD prims (Pallet_00..02) so nothing
+# above the bridge changes. Spread left/right so each forklift has non-crossing work.
 _PALLET_GRID = [
-    (-3.0, -3.0), (-3.0, 0.0), (-3.0, 3.0),
-    (3.0, -3.0), (3.0, 0.0), (3.0, 3.0),
+    (-3.0, -3.0), (-3.0, 3.0), (1.0, 5.0),
 ]
 PALLETS = {f"WH_Palette_{i + 1:02d}": {"xy": xy, "path": f"/World/Pallets/Pallet_{i:02d}"}
            for i, xy in enumerate(_PALLET_GRID)}
@@ -51,6 +51,12 @@ ZONES = {
     "stage_1": (-6.0, 7.0),
     "stage_2": (0.0, 7.0),
     "stage_3": (6.0, 7.0),
+}
+# Charger docks (mirror scenes/scene_exec.py). Exposed in /state so the UI can
+# draw them; each doubles as a forklift home/charge point.
+CHARGERS = {
+    "charge_1": (-6.0, -3.0),
+    "charge_2": (6.0, 3.0),
 }
 
 # Densify every route into short, evenly-spaced waypoints so the truck tracks the
@@ -82,10 +88,12 @@ class IsaacNavBackend:
             self.bus.set_zone(zid, x=zx, y=zy, blocked=False)
 
         # Build a routing roadmap over the floor (the deployed scene has no graph).
-        # cell=1.0 so every spawn (±6,±3), pallet (±3, -3/0/3) and staging bay
-        # (-6/0/6, 7) lands EXACTLY on a node — a coarser 2 m grid left pallets
-        # between nodes, so obstacle-blocking mis-rounded and routes clipped racks.
-        self._rm = Roadmap.from_snapshot(self._layout_snapshot(), cell=1.0, margin=2.0)
+        # A fixed 20×20 uniform mesh spans the whole floor: fine, evenly-spaced waypoints
+        # give the trucks a smoother, more legible trajectory than the old coarse 1 m grid
+        # and populate the ops-map with a dense 20×20 marker field. Resting-pallet cells are
+        # punched out so A* naturally arcs around loaded rack faces; the bridge still appends
+        # the exact goal + a standoff run-in, so nodes needn't line up on pallets exactly.
+        self._rm = Roadmap.from_snapshot(self._layout_snapshot(), grid=(20, 20), margin=2.0)
         self.bus.graph = {
             "nodes": {n: list(xy) for n, xy in self._rm.nodes.items()},
             "edges": sorted({tuple(sorted((a, b)))
@@ -106,14 +114,40 @@ class IsaacNavBackend:
         t = self.bus.get_telemetry(name)
         return (t.x, t.y)
 
+    # Radius (m) around another forklift whose roadmap cells are treated as blocked while
+    # routing, so a dispatched truck arcs clear of a parked one instead of driving through
+    # it. ~1.8 m ≈ the ~2.5 m truck body's half-width plus a safety margin.
+    AVOID_RADIUS = 1.8
+
+    def _blocked_by_others(self, name: str) -> set[str]:
+        """Roadmap nodes to avoid because another (non-`name`) forklift occupies them.
+
+        This is the geometric half of deconfliction: CBS reasons over the node graph, and
+        here we mirror that by punching out each parked truck's footprint so the routed
+        world-space path (and its floor overlay) bends around it rather than clipping it.
+        """
+        blocked: set[str] = set()
+        for other in FORKLIFTS:
+            if other == name:
+                continue
+            ox, oy = self._fk_pos(other)
+            blocked |= self._rm.nodes_within(ox, oy, self.AVOID_RADIUS)
+        return blocked
+
     def _route_xy(self, start_xy: tuple[float, float],
-                  goal_xy: tuple[float, float]) -> list[tuple[float, float]]:
-        """A* over the roadmap, returned as world-space waypoints ending exactly on goal."""
+                  goal_xy: tuple[float, float],
+                  avoid: set[str] | None = None) -> list[tuple[float, float]]:
+        """Turn-minimising A* over the roadmap, returned as world-space waypoints ending
+        exactly on the goal. We plan with `astar_straight` (long straight runs, few
+        corners — better for a forklift and clearer as a floor overlay) and then collapse
+        collinear nodes so each straight aisle is a single segment before densifying.
+        `avoid` blocks nodes under other forklifts so the route steers around them."""
         a = self._rm.nearest(*start_xy)
         b = self._rm.nearest(*goal_xy)
-        path = self._rm.astar(a, b)
+        path = self._rm.astar_straight(a, b, avoid=avoid)
         wpts = [self._rm.nodes[n] for n in path]
         wpts.append(goal_xy)
+        wpts = self._rm.collapse_collinear([tuple(p) for p in wpts])
         return wpts
 
     @staticmethod
@@ -132,22 +166,24 @@ class IsaacNavBackend:
         return out
 
     def _route_fine(self, start_xy: tuple[float, float],
-                    goal_xy: tuple[float, float]) -> list[tuple[float, float]]:
+                    goal_xy: tuple[float, float],
+                    avoid: set[str] | None = None) -> list[tuple[float, float]]:
         """A* to the target, densified into short steps for tight tracking and a
         straight, precise final run-in onto the pallet/zone."""
-        return self._densify(self._route_xy(start_xy, goal_xy))
+        return self._densify(self._route_xy(start_xy, goal_xy, avoid=avoid))
 
     def _route_approach(self, start_xy: tuple[float, float],
                         goal_xy: tuple[float, float],
-                        approach: float = APPROACH_LEN) -> list[tuple[float, float]]:
+                        approach: float = APPROACH_LEN,
+                        avoid: set[str] | None = None) -> list[tuple[float, float]]:
         """Route toward a pick/drop target but STOP ~`approach` m short of it, keeping
         the inward-facing heading. A forklift is a ~2.5 m body: driving its CENTRE onto
         the pallet cell rams the pallet/rack and wedges the truck ~1.3 m out (observed).
         Instead we trim the final run-in so the truck halts just in front, forks reaching
         under the load, then the controller engages the fork there. Heading is preserved
         because we truncate ALONG the planned inward path (never aim the body at the
-        obstacle)."""
-        full = self._densify(self._route_xy(start_xy, goal_xy))
+        obstacle). `avoid` steers the approach clear of other forklifts."""
+        full = self._densify(self._route_xy(start_xy, goal_xy, avoid=avoid))
         if len(full) < 2:
             return full
         tx, ty = goal_xy
@@ -171,7 +207,7 @@ class IsaacNavBackend:
         if node not in self._rm.nodes:
             return {"ok": False, "error": f"unknown node {node}"}
         goal = self._rm.nodes[node]
-        wpts = self._route_xy(self._fk_pos(name), goal)
+        wpts = self._route_xy(self._fk_pos(name), goal, avoid=self._blocked_by_others(name))
         self.bus.send_mission(name, [Leg(action="goto", target=node, waypoints=wpts)])
         return {"ok": True, "route": self._route_ids(wpts)}
 
@@ -181,7 +217,8 @@ class IsaacNavBackend:
         meta = PALLETS.get(pallet_id)
         if not meta:
             return {"ok": False, "error": f"unknown pallet {pallet_id}"}
-        wpts = self._route_approach(self._fk_pos(name), meta["xy"])
+        wpts = self._route_approach(self._fk_pos(name), meta["xy"],
+                                    avoid=self._blocked_by_others(name))
         leg = Leg(action="pick", target=pallet_id, waypoints=wpts, pallet_path=meta["path"])
         self.bus.send_mission(name, [leg])
         return {"ok": True, "route": self._route_ids(wpts)}
@@ -192,7 +229,8 @@ class IsaacNavBackend:
         z = ZONES.get(zone_id)
         if not z:
             return {"ok": False, "error": f"unknown zone {zone_id}"}
-        wpts = self._route_approach(self._fk_pos(name), z)
+        wpts = self._route_approach(self._fk_pos(name), z,
+                                    avoid=self._blocked_by_others(name))
         leg = Leg(action="drop", target=zone_id, waypoints=wpts, drop_xy=z)
         self.bus.send_mission(name, [leg])
         return {"ok": True, "route": self._route_ids(wpts)}
@@ -201,7 +239,8 @@ class IsaacNavBackend:
         if name not in FORKLIFTS:
             return {"ok": False, "error": f"unknown forklift {name}"}
         hx, hy, _ = FORKLIFTS[name]
-        wpts = self._route_xy(self._fk_pos(name), (hx, hy))
+        wpts = self._route_xy(self._fk_pos(name), (hx, hy),
+                              avoid=self._blocked_by_others(name))
         self.bus.send_mission(name, [Leg(action="home", target="home", waypoints=wpts)])
         return {"ok": True, "route": self._route_ids(wpts)}
 
@@ -215,13 +254,15 @@ class IsaacNavBackend:
             return {"ok": False, "error": f"unknown forklift {name}"}
         legs: list[Leg] = []
         cur = self._fk_pos(name)
+        # Steer this truck's whole mission clear of where the other forklifts sit.
+        avoid = self._blocked_by_others(name)
         for step in steps:
             kind, target = (list(step) + [None])[:2]
             if kind == "pick":
                 meta = PALLETS.get(target)
                 if not meta:
                     return {"ok": False, "error": f"unknown pallet {target}"}
-                wpts = self._route_approach(cur, meta["xy"])
+                wpts = self._route_approach(cur, meta["xy"], avoid=avoid)
                 legs.append(Leg(action="pick", target=target, waypoints=wpts,
                                 pallet_path=meta["path"]))
                 cur = meta["xy"]
@@ -229,19 +270,19 @@ class IsaacNavBackend:
                 z = ZONES.get(target)
                 if not z:
                     return {"ok": False, "error": f"unknown zone {target}"}
-                wpts = self._route_approach(cur, z)
+                wpts = self._route_approach(cur, z, avoid=avoid)
                 legs.append(Leg(action="drop", target=target, waypoints=wpts, drop_xy=z))
                 cur = z
             elif kind == "goto":
                 if target not in self._rm.nodes:
                     return {"ok": False, "error": f"unknown node {target}"}
                 goal = self._rm.nodes[target]
-                wpts = self._route_xy(cur, goal)
+                wpts = self._route_xy(cur, goal, avoid=avoid)
                 legs.append(Leg(action="goto", target=target, waypoints=wpts))
                 cur = goal
             elif kind == "home":
                 hx, hy, _ = FORKLIFTS[name]
-                wpts = self._route_xy(cur, (hx, hy))
+                wpts = self._route_xy(cur, (hx, hy), avoid=avoid)
                 legs.append(Leg(action="home", target="home", waypoints=wpts))
                 cur = (hx, hy)
             else:
@@ -270,17 +311,20 @@ class IsaacNavBackend:
                 "object_detected": t.object_detected,
                 "object_distance": round(t.object_distance, 3),
                 "path_blocked": bool(t.path_blocked),
+                "battery": round(getattr(t, "battery", 100.0), 1),
             }
         pallets = {pid: {"x": round(p["x"], 3), "y": round(p["y"], 3),
                          "carried_by": p.get("carried_by"), "delivered": bool(p.get("delivered"))}
                    for pid, p in self.bus.pallets.items()}
         zones = {zid: {"x": z["x"], "y": z["y"], "blocked": bool(z.get("blocked"))}
                  for zid, z in self.bus.zones.items()}
+        chargers = {cid: {"x": x, "y": y} for cid, (x, y) in CHARGERS.items()}
         return {
             "t": round(self.bus.elapsed(), 2),
             "forklifts": forklifts,
             "pallets": pallets,
             "zones": zones,
+            "chargers": chargers,
             "graph": self.bus.graph,
         }
 

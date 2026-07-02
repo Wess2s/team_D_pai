@@ -37,6 +37,8 @@ let snap = null;              // latest /state snapshot
 let plan = null;              // latest /plan (cuOpt assignment + CBS paths)
 let bounds = null;            // cached world bounds {minX,maxX,minY,maxY}
 let selected = null;         // selected forklift name (roster click)
+let graphMode = false;       // cuOpt routing-graph overlay toggle
+let dragPallet = null;       // { id, x, y } while an operator drags a pallet on the map
 let online = false;
 const view = {};             // per-forklift smoothed render state {x,y,yaw,trail[]}
 const kpiShown = { delivered: 0, transit: 0, waiting: 0, active: 0, throughput: 0, sim: 0 };
@@ -208,7 +210,9 @@ function draw(now) {
   drawLanes(snap);
   drawRacks(snap);
   drawZones(snap);
+  drawChargers(snap);
   drawPallets(snap);
+  if (graphMode) drawCuoptGraph(snap);
   drawPlanPaths(snap, now);
   drawRoutes(snap, now);
   drawTrails(snap);
@@ -233,6 +237,83 @@ function drawLanes(s) {
     ctx.fillStyle = "rgba(70,92,128,.55)";
     ctx.beginPath(); ctx.arc(sx(xy[0]), sy(xy[1]), 1.6, 0, 7); ctx.fill();
   }
+}
+
+// cuOpt routing-graph overlay — emphasises the nav graph (the nodes + edges cuOpt
+// routes over) and rings the logistics entities that become cuOpt Node ids
+// (pallets, staging zones, forklift starts). Toggled by the "◈ Graph" button.
+function nearestGraphNode(nodes, x, y) {
+  let best = null, bd = Infinity;
+  for (const [id, xy] of Object.entries(nodes)) {
+    if (id.startsWith("rack")) continue;
+    const d = (xy[0] - x) * (xy[0] - x) + (xy[1] - y) * (xy[1] - y);
+    if (d < bd) { bd = d; best = xy; }
+  }
+  return best;
+}
+
+function drawCuoptGraph(s) {
+  const nodes = (s.graph && s.graph.nodes) || {};
+  const edges = (s.graph && s.graph.edges) || [];
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+
+  ctx.save();
+  // dim the scene so the graph pops
+  ctx.fillStyle = "rgba(5,8,13,.55)";
+  ctx.fillRect(0, 0, w, h);
+
+  // edges
+  ctx.lineCap = "round";
+  ctx.strokeStyle = hexA(NV, .32); ctx.lineWidth = 1.2; ctx.setLineDash([]);
+  for (const [a, b] of edges) {
+    if (!nodes[a] || !nodes[b]) continue;
+    ctx.beginPath();
+    ctx.moveTo(sx(nodes[a][0]), sy(nodes[a][1]));
+    ctx.lineTo(sx(nodes[b][0]), sy(nodes[b][1]));
+    ctx.stroke();
+  }
+  // nodes
+  for (const [id, xy] of Object.entries(nodes)) {
+    if (id.startsWith("rack")) continue;
+    ctx.fillStyle = hexA(NV, .85);
+    ctx.beginPath(); ctx.arc(sx(xy[0]), sy(xy[1]), 2.1, 0, 7); ctx.fill();
+  }
+  // entity nodes (cuOpt Node ids). Zone labels sit ABOVE the node, pallet labels
+  // BELOW, so a pallet resting on a staging bay doesn't overprint the zone name.
+  const mark = (wx, wy, col, label, above) => {
+    const px = sx(wx), py = sy(wy);
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(px, py, 6, 0, 7); ctx.stroke();
+    ctx.fillStyle = col;
+    ctx.font = "700 9px 'JetBrains Mono', monospace";
+    ctx.textAlign = "center"; ctx.textBaseline = above ? "bottom" : "top";
+    ctx.fillText(label, px, above ? py - 9 : py + 9);
+  };
+  // Zones first (green rings, label above).
+  for (const [id, z] of Object.entries(s.zones || {})) {
+    const n = nearestGraphNode(nodes, z.x, z.y); if (!n) continue;
+    mark(n[0], n[1], NV, id.toUpperCase(), true);
+  }
+  // Only pallets still AWAITING pickup are meaningful cuOpt pickup nodes; delivered
+  // ones sit on a staging bay and would just clutter the zone marker.
+  for (const [id, p] of Object.entries(s.pallets || {})) {
+    if (p.carried_by || p.delivered) continue;
+    const n = nearestGraphNode(nodes, p.x, p.y); if (!n) continue;
+    mark(n[0], n[1], AMBER, id.replace("WH_Palette_", "P"), false);
+  }
+  // Forklifts are already drawn (sprite + label) by drawForklifts on top of this
+  // overlay, so we don't re-mark them here (avoids duplicate AMR_x labels).
+
+  // badge — bottom-left, clear of the floating panel title.
+  const badge = `cuOpt graph · ${Object.keys(nodes).length} nodes · ${edges.length} edges`;
+  ctx.font = "700 11px 'JetBrains Mono', monospace";
+  const tw = ctx.measureText(badge).width;
+  roundRect(12, h - 38, tw + 24, 26, 7);
+  ctx.fillStyle = "rgba(7,11,17,.9)"; ctx.fill();
+  ctx.strokeStyle = hexA(NV, .5); ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = NV; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(badge, 24, h - 25);
+  ctx.restore();
 }
 
 function drawRacks(s) {
@@ -275,20 +356,44 @@ function drawZones(s) {
   }
 }
 
+function drawChargers(s) {
+  const u = TF.s;
+  const CY = "#3bd6ff";
+  for (const [id, ch] of Object.entries(s.chargers || {})) {
+    const x = sx(ch.x), y = sy(ch.y), r = 0.9 * u;
+    roundRect(x - r, y - r, r * 2, r * 2, 6);
+    ctx.fillStyle = hexA(CY, .10); ctx.fill();
+    ctx.save();
+    ctx.strokeStyle = CY; ctx.lineWidth = 1.6; ctx.setLineDash([3, 3]); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = CY;
+    ctx.font = `700 ${Math.max(11, 1.1 * u)}px 'JetBrains Mono', monospace`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("\u26A1", x, y);
+    ctx.font = "700 8.5px 'JetBrains Mono', monospace";
+    ctx.textBaseline = "top";
+    ctx.fillText(id.toUpperCase().replace("CHARGE_", "CHG "), x, y + r + 3);
+  }
+}
+
 function drawPallets(s) {
   const u = TF.s;
   for (const [id, p] of Object.entries(s.pallets || {})) {
-    if (p.carried_by) continue;
-    const x = sx(p.x), y = sy(p.y), r = 0.55 * u;
-    const col = p.delivered ? NV : AMBER;
-    // shadow
-    roundRect(x - r + 2, y - r + 3, r * 2, r * 2, 4); ctx.fillStyle = "rgba(0,0,0,.35)"; ctx.fill();
+    const dragging = dragPallet && dragPallet.id === id;
+    if (p.carried_by && !dragging) continue;
+    const wxp = dragging ? dragPallet.x : p.x;
+    const wyp = dragging ? dragPallet.y : p.y;
+    const x = sx(wxp), y = sy(wyp), r = 0.55 * u;
+    const col = p.delivered && !dragging ? NV : AMBER;
+    // shadow (lifted a little while dragging)
+    const lift = dragging ? 6 : 3;
+    roundRect(x - r + 2, y - r + lift, r * 2, r * 2, 4); ctx.fillStyle = "rgba(0,0,0,.35)"; ctx.fill();
     // body
     roundRect(x - r, y - r, r * 2, r * 2, 4);
     const g = ctx.createLinearGradient(x, y - r, x, y + r);
     g.addColorStop(0, hexA(col, 1)); g.addColorStop(1, hexA(col, .78));
     ctx.fillStyle = g; ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.strokeStyle = dragging ? "#fff" : "rgba(255,255,255,.55)"; ctx.lineWidth = dragging ? 1.8 : 1; ctx.stroke();
     // slats
     ctx.strokeStyle = "rgba(0,0,0,.22)"; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(x, y - r + 2); ctx.lineTo(x, y + r - 2); ctx.stroke();
@@ -506,6 +611,10 @@ function makeRosterCard(name) {
       <div class="rc-metric"><div class="m-val v-lift">0.0</div><div class="m-lab">lift</div></div>
       <div class="rc-metric"><div class="m-val v-yaw">0°</div><div class="m-lab">yaw</div></div>
       <div class="rc-metric"><div class="m-val v-prox">—</div><div class="m-lab">prox</div></div>
+    </div>
+    <div class="rc-batt" title="Battery">
+      <div class="rc-batt-track"><span class="rc-batt-fill"></span></div>
+      <div class="rc-batt-pct">100%</div>
     </div>`;
   el.addEventListener("click", () => {
     selected = (selected === name) ? null : name;
@@ -519,6 +628,8 @@ function makeRosterCard(name) {
     spd: el.querySelector(".v-spd"), lift: el.querySelector(".v-lift"),
     yaw: el.querySelector(".v-yaw"), prox: el.querySelector(".v-prox"),
     avatar: el.querySelector(".rc-avatar"),
+    battFill: el.querySelector(".rc-batt-fill"),
+    battPct: el.querySelector(".rc-batt-pct"),
   };
   return el;
 }
@@ -537,6 +648,14 @@ function updateRosterData(s) {
     const det = fk.object_detected;
     r.prox.textContent = det ? (fk.object_distance || 0).toFixed(1) + "m" : "clear";
     r.prox.style.color = det ? AMBER : "";
+    if (r.battFill) {
+      const bat = (fk.battery == null) ? 100 : fk.battery;
+      const bc = bat > 50 ? NV : (bat > 20 ? AMBER : RED);
+      r.battFill.style.width = Math.max(0, Math.min(100, bat)) + "%";
+      r.battFill.style.background = bc;
+      r.battPct.textContent = Math.round(bat) + "%";
+      r.battPct.style.color = bc;
+    }
   }
 }
 
@@ -887,12 +1006,80 @@ function initStageToggle() {
   window.addEventListener("pagehide", stopStream);
 }
 
+function initGraphToggle() {
+  const gb = document.getElementById("graphBtn");
+  if (!gb) return;
+  gb.addEventListener("click", () => {
+    graphMode = !graphMode;
+    gb.classList.toggle("active", graphMode);
+    // The overlay lives on the 2D map, so make sure that view is showing.
+    if (graphMode) setStageView("map");
+  });
+}
+
+// ── Draggable pallets ──────────────────────────────────────────────────────
+// Drag a pallet across the 2D map to reposition it; on drop we POST /move_pallet
+// and the sim teleports the pallet prim (Isaac) / repositions it (mock).
+function worldFromEvent(e) {
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left, py = e.clientY - rect.top;
+  return { px, py, wx: (px - TF.ox) / TF.s, wy: (TF.oy - py) / TF.s };
+}
+
+function palletAt(px, py) {
+  if (!snap) return null;
+  let best = null, bd = 16;   // hit radius in CSS px
+  for (const [id, p] of Object.entries(snap.pallets || {})) {
+    if (p.carried_by) continue;
+    const d = Math.hypot(sx(p.x) - px, sy(p.y) - py);
+    if (d < bd) { bd = d; best = { id, x: p.x, y: p.y }; }
+  }
+  return best;
+}
+
+function initPalletDrag() {
+  if (!canvas) return;
+  const inMapView = () =>
+    (document.getElementById("stage") || {}).dataset?.view !== "stream";
+
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || !inMapView()) return;
+    const { px, py } = worldFromEvent(e);
+    const hit = palletAt(px, py);
+    if (hit) { dragPallet = hit; canvas.style.cursor = "grabbing"; e.preventDefault(); }
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    const { px, py, wx, wy } = worldFromEvent(e);
+    if (dragPallet) { dragPallet.x = wx; dragPallet.y = wy; return; }
+    if (inMapView()) canvas.style.cursor = palletAt(px, py) ? "grab" : "default";
+  });
+
+  const finishDrag = async () => {
+    if (!dragPallet) return;
+    const d = dragPallet;
+    canvas.style.cursor = "default";
+    try {
+      await fetch("/move_pallet", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pallet: d.id, x: d.x, y: d.y }),
+      });
+    } catch {}
+    // Hold the optimistic position briefly so it doesn't snap back before the
+    // sim's teleport lands in the next /state poll.
+    setTimeout(() => { if (dragPallet === d) dragPallet = null; }, 900);
+  };
+  window.addEventListener("mouseup", finishDrag);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Boot
 // ═══════════════════════════════════════════════════════════════════════════
 buildLegend();
 initChat();
 initStageToggle();
+initGraphToggle();
+initPalletDrag();
 health();
 poll();
 pollPlan();

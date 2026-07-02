@@ -85,6 +85,10 @@ class Mission(BaseModel):
 class ZoneReq(BaseModel):
     zone: str
 
+class MovePallet(BaseModel):
+    pallet: str
+    x: float
+    y: float
 
 class ChatReq(BaseModel):
     message: str
@@ -145,6 +149,14 @@ def mission(req: Mission) -> dict:
 @app.post("/block_zone")
 def block_zone(req: ZoneReq) -> dict:
     return _sim.block_zone(req.zone)
+
+
+@app.post("/move_pallet")
+def move_pallet(req: MovePallet) -> dict:
+    """Operator dragged a pallet on the 2D map -> reposition it in the scene."""
+    if not hasattr(_sim, "move_pallet"):
+        return {"ok": False, "error": "backend does not support move_pallet"}
+    return _sim.move_pallet(req.pallet, req.x, req.y)
 
 
 @app.post("/chat")

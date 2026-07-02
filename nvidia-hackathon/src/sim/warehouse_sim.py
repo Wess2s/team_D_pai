@@ -302,6 +302,17 @@ class WarehouseSim:
                 return {"ok": True, "blocked": zone_id}
             return {"ok": False, "error": f"unknown zone {zone_id}"}
 
+    def move_pallet(self, pallet_id: str, x: float, y: float) -> dict:
+        """Operator dragged a pallet on the map: reposition it (if not carried)."""
+        with self._lock:
+            p = self.pallets.get(pallet_id)
+            if p is None:
+                return {"ok": False, "error": f"unknown pallet {pallet_id}"}
+            if getattr(p, "carried_by", None):
+                return {"ok": False, "error": f"{pallet_id} is being carried"}
+            p.x = float(x); p.y = float(y)
+            return {"ok": True}
+
     # ---- simulation step ------------------------------------------------- #
     def step(self, dt: float) -> None:
         with self._lock:

@@ -15,6 +15,7 @@ import sys
 
 from . import offline_intent
 from .tools import TOOL_SCHEMAS, call_tool
+from . import tools as _tools
 
 try:
     from .nim_client import chat
@@ -49,8 +50,18 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
     parts = []
     for name, kwargs, out in results:
         if name == "move_pallet":
-            parts.append(f"moving {kwargs.get('pallet')} → {kwargs.get('zone')}"
-                         + (f" ({kwargs['robot']})" if "robot" in kwargs else ""))
+            data = json.loads(out)
+            if not data.get("ok"):
+                parts.append(data.get("error", "move failed"))
+            else:
+                cbsd = data.get("cbs", {})
+                asg = "; ".join(f"{fk}: {', '.join(t)}"
+                                for fk, t in (_tools.LAST_PLAN.get("assignments") or {}).items())
+                parts.append(
+                    f"cuOpt ({data.get('solver')}) routed {asg or kwargs.get('pallet')}, "
+                    f"cost {data.get('total_cost')}; CBS checked "
+                    f"{cbsd.get('conflicts_found', 0)} conflict(s), "
+                    f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}")
         elif name == "optimize_and_dispatch":
             data = json.loads(out)
             if not data.get("ok"):

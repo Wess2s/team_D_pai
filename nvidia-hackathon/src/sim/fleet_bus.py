@@ -52,6 +52,7 @@ class Telemetry:
     object_detected: str = "None"
     object_distance: float = 0.0
     path_blocked: bool = False
+    battery: float = 100.0
 
 
 class FleetBus:
@@ -62,6 +63,7 @@ class FleetBus:
         self.pallets: dict[str, dict] = {}   # pallet id -> {x,y,carried_by,delivered}
         self.zones: dict[str, dict] = {}     # zone id   -> {x,y,blocked}
         self.graph: dict = {"nodes": {}, "edges": []}
+        self.pallet_moves: dict[str, tuple] = {}   # pallet id -> (x, y) operator drag requests
         self.t0 = time.time()
 
     # ---- registration ---------------------------------------------------- #
@@ -110,6 +112,17 @@ class FleetBus:
         with self._lock:
             self.zones.setdefault(zid, {"x": 0.0, "y": 0.0, "blocked": False})
             self.zones[zid].update(fields)
+
+    # ---- operator pallet drags (bridge writes, controller drains) -------- #
+    def request_pallet_move(self, pid: str, x: float, y: float) -> None:
+        with self._lock:
+            self.pallet_moves[pid] = (float(x), float(y))
+
+    def drain_pallet_moves(self) -> dict:
+        with self._lock:
+            moves = dict(self.pallet_moves)
+            self.pallet_moves.clear()
+            return moves
 
     def elapsed(self) -> float:
         return time.time() - self.t0
