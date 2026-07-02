@@ -1,3 +1,4 @@
+cat > sim_bridge.py << 'EOF'
 """
 sim_bridge.py
 -------------
@@ -33,6 +34,8 @@ import textwrap
 from dataclasses import asdict
 
 import socket
+import json
+import time
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -56,9 +59,15 @@ def dispatch_task(task) -> dict:
     action = task.action
 
     if action == "pick":
+        _run_script(_script_reset_pick())
+        _run_script(_script_bake_pallet_position(task.pallet_id))
+        time.sleep(0.5)  # Give physics time to settle
         script = _script_pick(task.pallet_id)
 
     elif action == "move":
+        _run_script(_script_reset_pick())
+        _run_script(_script_bake_pallet_position(task.pallet_id))
+        time.sleep(0.5)  # Give physics time to settle
         if task.drop_area_id:
             # Named destination: pick + set drop area
             script = _script_move_to_area(task.pallet_id, task.drop_area_id)
@@ -104,17 +113,160 @@ def _forklift_prim_setup() -> str:
     """).strip()
 
 
-def _script_pick(pallet_id: str) -> str:
-    return _forklift_prim_setup() + textwrap.dedent(f"""
+def _script_reset_pick() -> str:
+    """Clear pick state so backup.py change-detection fires on the next command."""
+    return _forklift_prim_setup() + textwrap.dedent("""
 
-        # Stop any current activity first
         set_bool("navGoTo",     False)
         set_bool("navGoToPick", False)
         set_bool("navGoToDrop", False)
         set_bool("navGoHome",   False)
         clear_rel("navPalletToPick")
+        clear_rel("navDropTransform")
+        set_str("navPalletToPickId", "")
+        set_str("navAreaToDrop",     "")
+        print("[bridge] pick state reset")
+    """)
 
-        # Set new pick target
+
+def _script_bake_pallet_position(pallet_id: str) -> str:
+    """Sync the pallet's physics position back to USD so backup.py sees it.
+
+    Physics writes to Fabric (GPU cache). USD reads from layers.
+    We need to use Fabric API to get the REAL position, then write to USD.
+    """
+    return textwrap.dedent(f"""
+        import omni.usd
+        from pxr import UsdGeom, Gf, Usd, UsdPhysics
+        
+        stage = omni.usd.get_context().get_stage()
+
+        # Find pallet prim by palletId attribute
+        pallet_prim = None
+        for p in stage.Traverse():
+            a = p.GetAttribute("palletId")
+            if a and a.IsValid() and str(a.Get()) == "{pallet_id}":
+                pallet_prim = p
+                break
+        if pallet_prim is None:
+            pallet_prim = stage.GetPrimAtPath("/World/{pallet_id}")
+        if not pallet_prim or not pallet_prim.IsValid():
+            print("[bridge] bake: pallet not found")
+            raise SystemExit
+
+        pallet_path = str(pallet_prim.GetPath())
+        xformable = UsdGeom.Xformable(pallet_prim)
+
+        # Method 1: Try Fabric API (where physics actually writes)
+        live_pos = None
+        try:
+            import omni.fabric
+            stage_id = omni.usd.get_context().get_stage_id()
+            fabric_conn = omni.fabric.get_fabric_interface()
+            # Try to get world position from Fabric
+            from pxr import UsdGeom
+            import carb
+            
+            # Use the XformCache with UsdTimeCode() - no argument = current time
+            cache = UsdGeom.XformCache()
+            world_xform = cache.GetLocalToWorldTransform(pallet_prim)
+            t = world_xform.ExtractTranslation()
+            live_pos = Gf.Vec3d(float(t[0]), float(t[1]), float(t[2]))
+            print(f"[bridge] XformCache current time: {{live_pos}}")
+        except Exception as e:
+            print(f"[bridge] Fabric/XformCache failed: {{e}}")
+
+        # Method 2: Try to get authored + animated value
+        if live_pos is None:
+            try:
+                # Get the actual attribute value at current frame
+                translate_attr = pallet_prim.GetAttribute("xformOp:translate")
+                if translate_attr:
+                    import omni.timeline
+                    current_time = omni.timeline.get_timeline_interface().get_current_time()
+                    fps = stage.GetTimeCodesPerSecond() or 24.0
+                    tc = Usd.TimeCode(current_time * fps)
+                    v = translate_attr.Get(tc)
+                    if v:
+                        live_pos = Gf.Vec3d(float(v[0]), float(v[1]), float(v[2]))
+                        print(f"[bridge] translate attr at frame: {{live_pos}}")
+            except Exception as e:
+                print(f"[bridge] timeline attr failed: {{e}}")
+
+        # Method 3: Fall back to current composed value 
+        if live_pos is None:
+            t = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+            live_pos = Gf.Vec3d(float(t[0]), float(t[1]), float(t[2]))
+            print(f"[bridge] fallback default: {{live_pos}}")
+
+        # CRITICAL: Write to USD with NO timecode (affects all times)
+        # First, disable physics on this pallet so it doesn't fight us
+        try:
+            rb = UsdPhysics.RigidBodyAPI(pallet_prim)
+            if rb:
+                enabled = rb.GetRigidBodyEnabledAttr()
+                if enabled:
+                    enabled.Set(False)
+                    print("[bridge] disabled rigid body")
+        except:
+            pass
+
+        # Now set the translate
+        translate_attr = pallet_prim.GetAttribute("xformOp:translate")
+        if translate_attr and translate_attr.IsValid():
+            translate_attr.Set(live_pos)
+            print(f"[bridge] wrote xformOp:translate = {{live_pos}}")
+        
+        # Re-enable physics
+        try:
+            rb = UsdPhysics.RigidBodyAPI(pallet_prim)
+            if rb:
+                enabled = rb.GetRigidBodyEnabledAttr()
+                if enabled:
+                    enabled.Set(True)
+        except:
+            pass
+
+        # DEBUG: Verify what backup.py will see
+        verify = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+        print(f"[bridge] VERIFY backup.py sees: ({{float(verify[0]):.3f}}, {{float(verify[1]):.3f}}, {{float(verify[2]):.3f}})")
+    """).strip()
+
+
+def _script_debug_position(pallet_id: str) -> str:
+    """Debug: print what backup.py will see when it reads the pallet position."""
+    return textwrap.dedent(f"""
+        import omni.usd
+        from pxr import UsdGeom, Gf, Usd
+        stage = omni.usd.get_context().get_stage()
+
+        # Find pallet exactly like backup.py does
+        pallet_prim = None
+        for p in stage.Traverse():
+            a = p.GetAttribute("palletId")
+            if a and a.IsValid() and str(a.Get()) == "{pallet_id}":
+                pallet_prim = p
+                break
+
+        if pallet_prim:
+            # Read exactly like backup.py's _world_pos() does
+            t = UsdGeom.Xformable(pallet_prim).ComputeLocalToWorldTransform(
+                Usd.TimeCode.Default()).ExtractTranslation()
+            print(f"[DEBUG] backup.py will see: ({{float(t[0]):.3f}}, {{float(t[1]):.3f}}, {{float(t[2]):.3f}})")
+            
+            # Also show the raw xformOp:translate value
+            attr = pallet_prim.GetAttribute("xformOp:translate")
+            if attr and attr.IsValid():
+                v = attr.Get()
+                print(f"[DEBUG] raw xformOp:translate: {{v}}")
+        else:
+            print("[DEBUG] pallet not found!")
+    """).strip()
+
+
+def _script_pick(pallet_id: str) -> str:
+    return _forklift_prim_setup() + textwrap.dedent(f"""
+
         set_str("navPalletToPickId", "{pallet_id}")
         set_bool("navGoToPick", True)
         print("[bridge] pick {pallet_id} -> navGoToPick=True")
@@ -123,13 +275,6 @@ def _script_pick(pallet_id: str) -> str:
 
 def _script_move_to_area(pallet_id: str, drop_area_id: str) -> str:
     return _forklift_prim_setup() + textwrap.dedent(f"""
-
-        set_bool("navGoTo",     False)
-        set_bool("navGoToPick", False)
-        set_bool("navGoToDrop", False)
-        set_bool("navGoHome",   False)
-        clear_rel("navPalletToPick")
-        clear_rel("navDropTransform")
 
         set_str("navPalletToPickId", "{pallet_id}")
         set_str("navAreaToDrop",     "{drop_area_id}")
@@ -295,7 +440,7 @@ if __name__ == "__main__":
     from llm_task_parser import parse_command
 
     TEST_COMMANDS = [
-        "move blockpallet_a09 one metre to the left",
+        "pick up blockpallet_a09 and drop it to the right",
     ]
 
     for cmd in TEST_COMMANDS:
@@ -306,3 +451,4 @@ if __name__ == "__main__":
             result = dispatch_task(task)
             status = "OK" if result["ok"] else "FAIL"
             print(f"  Result : [{status}] {result['message'][:120]}")
+EOF
