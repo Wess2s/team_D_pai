@@ -1,3 +1,5 @@
+cat > llm_task_parser.py << 'EOF'
+
 """
 llm_task_parser.py
 ------------------
@@ -9,7 +11,7 @@ its USD attributes (navPalletToPickId, navAreaToDrop, navGoToPick, etc.).
 
 Requires:
     pip install openai
-    export NVIDIA_API_KEY=<your key from https://build.nvidia.com>
+    export NVIDIA_API_KEY=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>
 
 Quick test:
     python llm_task_parser.py
@@ -65,7 +67,7 @@ AVAILABLE PALLETS  (use exact id strings):
   ["blockpallet_b02", "blockpallet_a06", "blockpallet_c01", "blockpallet_a09"]
 
 AVAILABLE DROP AREAS  (use exact id strings):
-  ["Buffer_A", "Buffer_B", "Rack_01", "Rack_02", "Dock_01"]
+  ["DropZone_Left", "DropZone_Right", "DropZone_Front", "DropZone_Back"]
 
 TASK SCHEMA (every element of the array must match this):
 {
@@ -79,8 +81,10 @@ TASK SCHEMA (every element of the array must match this):
 }
 
 RULES:
-1. "move <pallet> N metres <direction>" -> action="move", set pallet_id and the
-   matching offset_x / offset_y. Do NOT set drop_area_id when using an offset.
+1. "move <pallet> <direction>" -> action="move", set pallet_id AND map direction to
+   the closest named drop area: left/west -> "DropZone_Left", right/east -> "DropZone_Right",
+   forward/north -> "DropZone_Front", back/backward/south -> "DropZone_Back".
+   Always set drop_area_id. Never set offset_x/offset_y; leave them as 0.
 2. "put / drop <pallet> in/at <area>"  -> action="move", set pallet_id and drop_area_id.
 3. "pick up <pallet> and drop it in <area>" -> action="move", set BOTH pallet_id AND
    drop_area_id. Never split this into two tasks.
@@ -88,7 +92,7 @@ RULES:
 5. "go home" / "return"                -> action="go_home".
 6. "stop" / "halt"                     -> action="stop".
 7. If the pallet is not named, default to "blockpallet_b02" and note the ambiguity.
-8. If the drop area is not named and no offset is given, default to "Buffer_A" and note it.
+8. If the drop area is not named and no offset is given, default to "DropZone_Front" and note it.
 9. Return ONLY the JSON array. No extra text, no markdown fences.
 """.strip()
 
@@ -96,7 +100,7 @@ RULES:
 # ── NIM client ─────────────────────────────────────────────────────────────
 
 def _get_client() -> OpenAI:
-    api_key = os.environ.get("NVIDIA_API_KEY", "")
+    api_key = os.environ.get("NVIDIA_API_KEY", "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")
     if not api_key:
         raise EnvironmentError(
             "NVIDIA_API_KEY is not set.\n"
@@ -203,3 +207,4 @@ if __name__ == "__main__":
             break
         except Exception as exc:
             print(f"  ERROR: {exc}")
+EOF
