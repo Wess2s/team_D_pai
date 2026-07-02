@@ -141,9 +141,10 @@ LOG_EVERY     = 120
 #     our travel) since it will never move for us, then rejoin the route once clear.
 # Priority (right-of-way) goes to a loaded truck first, then to AMR_1 — a strict total
 # order, so exactly one of any moving pair yields and they never deadlock.
-YIELD_DIST    = 3.5                 # m, react when the other truck is this close
-EVADE_SPEED   = 0.8                 # fraction of KIN_SPEED used for the side-step
-YIELD_BEHIND  = -0.3                # cos threshold: ignore a truck clearly behind us
+YIELD_DIST    = 4.5                 # m, start slowing/stopping when the other is this close
+YIELD_STOP    = 3.0                 # m, fully stop and hold within this range
+EVADE_SPEED   = 0.8                 # fraction of KIN_SPEED used for the stationary side-step
+YIELD_BEHIND  = -0.2               # cos threshold: ignore a truck clearly behind us
 # ===========================================================================
 
 
@@ -776,16 +777,28 @@ def _init_controllers():
 
 
 def _pull_command(name, c):
-    """Adopt a newer mission from the bus (resets leg/waypoint cursors)."""
+    """Adopt a newer mission from the bus (resets leg/waypoint cursors).
+
+    IMPORTANT: while the truck is still CARRYING a pallet we DEFER adopting a new mission
+    until the current load has been dropped. Otherwise a command that arrives mid-delivery
+    (classically "send all forklifts home") preempts the drop leg while `carrying` stays
+    set, and `_carry_follow` then glues the undelivered pallet to the forks all the way to
+    the new destination — the pallet "rides home" instead of being staged. By deferring, the
+    truck finishes delivering to staging first, then (now empty, at idle) picks up the newer
+    mission on the next tick. The bus keeps returning the latest command, so nothing is lost.
+    """
     cmd = _BUS.get_command(name)
-    if cmd.seq != c["seq"] and cmd.legs:
-        c["seq"] = cmd.seq
-        c["legs"] = cmd.legs
-        c["leg_i"] = 0
-        c["wp_i"] = 0
-        c["phase"] = "navigate"
-        _log(f"[FleetMind] {name} mission seq={cmd.seq} legs="
-             f"{[(l.action, l.target) for l in cmd.legs]}")
+    if cmd.seq == c["seq"] or not cmd.legs:
+        return
+    if c.get("carrying"):
+        return                       # finish the drop first; adopt once empty
+    c["seq"] = cmd.seq
+    c["legs"] = cmd.legs
+    c["leg_i"] = 0
+    c["wp_i"] = 0
+    c["phase"] = "navigate"
+    _log(f"[FleetMind] {name} mission seq={cmd.seq} legs="
+         f"{[(l.action, l.target) for l in cmd.legs]}")
 
 
 def _phase_label(c):
@@ -850,6 +863,56 @@ def _nearest_other(name, cx, cy):
     return best
 
 
+def _travel_heading(oc):
+    """A controller's current world travel heading (radians) toward its active waypoint,
+    or None if it isn't navigating (idle / lifting / no remaining waypoint)."""
+    if oc.get("phase") != "navigate":
+        return None
+    legs = oc.get("legs") or []
+    li, wi = oc.get("leg_i", 0), oc.get("wp_i", 0)
+    if li >= len(legs):
+        return None
+    wps = legs[li].waypoints
+    if wi >= len(wps):
+        return None
+    tx, ty = wps[wi]
+    dx, dy = tx - oc["cx"], ty - oc["cy"]
+    if math.hypot(dx, dy) < 1e-6:
+        return None
+    return math.atan2(dy, dx)
+
+
+def _should_i_stop(name, c, cx, cy, my_travel, on, oc):
+    """Decide WHICH of the two trucks gives way — evaluated identically by both trucks so
+    they always agree (exactly one stops, no deadlock, no mutual clip).
+
+    Key idea: the truck that is driving MORE DIRECTLY INTO the other is the one whose path
+    is blocked, so IT stops; the other truck's path is comparatively clear, so it keeps
+    going and drives away — which then opens the gap and lets the stopped truck resume.
+    A true head-on (both aimed at each other) is symmetric, so we break that tie with the
+    strict right-of-way order.
+    """
+    ox, oy = oc["cx"], oc["cy"]
+    d = math.hypot(ox - cx, oy - cy) or 1.0
+    other_travel = _travel_heading(oc)
+    # my_ahead: how directly the OTHER sits in front of MY heading (1 = dead ahead).
+    my_ahead = -2.0
+    if my_travel is not None:
+        my_ahead = (math.cos(my_travel) * (ox - cx) + math.sin(my_travel) * (oy - cy)) / d
+    # other_ahead: how directly I sit in front of the OTHER's heading.
+    other_ahead = -2.0
+    if other_travel is not None:
+        other_ahead = (math.cos(other_travel) * (cx - ox)
+                       + math.sin(other_travel) * (cy - oy)) / d
+    EPS = 0.15
+    if my_ahead > other_ahead + EPS:
+        return True                     # I'm driving into them more -> I stop
+    if other_ahead > my_ahead + EPS:
+        return False                    # they're driving into me more -> they stop, I go
+    # Head-on / ambiguous: strict priority decides. Lower-priority truck stops.
+    return not _has_right_of_way(name, c, on, oc)
+
+
 def _yield_check(name, c, cx, cy, cyaw, travel, dt):
     """Reactive collision avoidance vs the other forklift, evaluated every step.
 
@@ -873,10 +936,6 @@ def _yield_check(name, c, cx, cy, cyaw, travel, dt):
     # currently braked-and-yielding is treated as a STATIONARY obstacle (it won't clear
     # for us, so we must go around it rather than wait forever).
     other_moving = (oc.get("phase") == "navigate") and not oc.get("yielding")
-    # Give way to a MOVING truck only when we are the lower-priority one; ALWAYS avoid a
-    # stationary blocker regardless of priority (no deadlock: it has no goal to reach).
-    if other_moving and _has_right_of_way(name, c, on, oc):
-        return (False, cx, cy, cyaw, 0.0)
 
     to_ox, to_oy = (ox - cx), (oy - cy)
     tod = math.hypot(to_ox, to_oy) or 1.0
@@ -884,6 +943,12 @@ def _yield_check(name, c, cx, cy, cyaw, travel, dt):
     if travel is not None:
         cosang = math.cos(travel) * (to_ox / tod) + math.sin(travel) * (to_oy / tod)
         if cosang < YIELD_BEHIND:
+            return (False, cx, cy, cyaw, 0.0)
+
+    if other_moving:
+        # Geometric heading-based decision: the truck driving MORE directly into the other
+        # stops; the one with the clear lane keeps going and drives away, opening the gap.
+        if not _should_i_stop(name, c, cx, cy, travel, on, oc):
             return (False, cx, cy, cyaw, 0.0)
 
     c["yielding"] = True

@@ -40,6 +40,15 @@ Translate operator commands into tool calls:
 After acting, summarise what you did in one or two plain-English sentences for the operator."""
 
 
+def _solver_label(solver: str | None) -> str:
+    """Operator-facing name for the optimiser that produced a plan."""
+    if solver == "cuopt":
+        return "NVIDIA cuOpt"
+    if solver == "local":
+        return "cuOpt local fallback"
+    return "cuOpt"
+
+
 def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
     """Build a short operator-facing summary from executed offline steps."""
     if not results:
@@ -58,7 +67,7 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
                 asg = "; ".join(f"{fk}: {', '.join(t)}"
                                 for fk, t in (_tools.LAST_PLAN.get("assignments") or {}).items())
                 parts.append(
-                    f"cuOpt ({data.get('solver')}) routed {asg or kwargs.get('pallet')}, "
+                    f"{_solver_label(data.get('solver'))} routed {asg or kwargs.get('pallet')}, "
                     f"cost {data.get('total_cost')}; CBS checked "
                     f"{cbsd.get('conflicts_found', 0)} conflict(s), "
                     f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}")
@@ -70,7 +79,7 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
                 cbsd = data.get("cbs", {})
                 n = len(data.get("dispatched", []))
                 parts.append(
-                    f"cuOpt ({data.get('solver')}) assigned {n} forklift(s), "
+                    f"{_solver_label(data.get('solver'))} assigned {n} forklift(s), "
                     f"tour cost {data.get('total_cost')}; CBS checked "
                     f"{cbsd.get('conflicts_found', 0)} conflict(s), "
                     f"{'all resolved' if cbsd.get('resolved') else 'staggered releases'}")
@@ -81,7 +90,7 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
             else:
                 asg = "; ".join(f"{fk}: {', '.join(t)}"
                                 for fk, t in data.get("assignments", {}).items())
-                parts.append(f"cuOpt plan ({data.get('solver')}, cost "
+                parts.append(f"{_solver_label(data.get('solver'))} plan (cost "
                              f"{data.get('total_cost')}) — {asg}")
         elif name == "pick_pallet":
             parts.append(f"picking {kwargs.get('pallet')}")

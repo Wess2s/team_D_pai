@@ -203,20 +203,64 @@ def _solve_cuopt(snap, rm, forklifts, tasks, all_pallets, all_zones) -> Plan:
         "task_data": {
             "task_locations": pickup_idx + delivery_idx,
             "demand": [[1] * len(pickup_idx) + [-1] * len(delivery_idx)],
-            "pickup_and_delivery_pairs": [[p, d] for p, d in zip(pickup_idx, delivery_idx)],
+            # cuOpt expects ORDER indices (position within task_locations), not location
+            # indices: task_locations = [pickups..., deliveries...], so pickup k is order k
+            # and its delivery is order len(pickups)+k.
+            "pickup_and_delivery_pairs": [
+                [k, len(pickup_idx) + k] for k in range(len(pickup_idx))
+            ],
         },
         "fleet_data": {
             "vehicle_locations": [[i, i] for i in range(len(fk_names))],
             "capacities": [[1] * len(fk_names)],
+            # Use the whole fleet so the multi-robot coordination (and CBS deconfliction)
+            # is exercised, rather than letting cuOpt minimise to a single vehicle.
+            "min_vehicles": min(len(fk_names), len(tasks)),
+            # A forklift finishes at the drop zone — it does NOT drive back to its start.
+            # Without this, cuOpt minimises the round-trip-to-depot and can pick a truck
+            # whose home is near the drop over the one actually closest to the pickup.
+            "drop_return_trips": [True] * len(fk_names),
         },
         "solver_config": {"time_limit": 2.0},
     }
-    resp = requests.post(f"{url}/cuopt/routes", json=payload, timeout=8)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _cuopt_solve(url, payload)
     routes = _parse_cuopt(data, fk_names, tasks, pickup_idx)
     total = _plan_cost(rm, snap, routes, all_pallets, all_zones)
     return Plan(routes, total, "cuopt")
+
+
+def _cuopt_solve(url: str, payload: dict) -> dict:
+    """Submit a VRP to the self-hosted cuOpt REST server and return the solution JSON.
+
+    cuOpt >= 25.x is async: POST /cuopt/request returns a reqId, then the solution is
+    polled from GET /cuopt/solution/{reqId}. Older builds returned the solution inline,
+    so we handle both. CLIENT-VERSION: custom skips the client/server version check.
+    """
+    import time
+
+    headers = {"CLIENT-VERSION": "custom"}
+    resp = requests.post(f"{url}/cuopt/request", json=payload, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Inline solution (older builds) — already has the solver response.
+    if "response" in data:
+        return data
+
+    req_id = data.get("reqId") or data.get("id")
+    if not req_id:
+        raise RuntimeError(f"cuOpt returned no reqId: {data}")
+
+    # Poll for the completed solution.
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        sol = requests.get(f"{url}/cuopt/solution/{req_id}", headers=headers, timeout=15)
+        sol.raise_for_status()
+        body = sol.json()
+        if "response" in body:
+            return body
+        time.sleep(0.25)
+    raise TimeoutError(f"cuOpt solution {req_id} did not complete in time")
 
 
 def _parse_cuopt(data, fk_names, tasks, pickup_idx) -> dict[str, list[tuple[str, str]]]:

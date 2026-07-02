@@ -8,15 +8,19 @@ set -euo pipefail
 PUBLIC_IP="${PUBLIC_IP:-100.104.13.18}"
 IMAGE="nvcr.io/nvidia/isaac-sim:6.0.1"
 PROJ="$HOME/nvidia-hackathon"
+# cuOpt self-hosted REST server (same host, --network=host) so the in-process planner
+# always uses NVIDIA cuOpt — never the local fallback. Override with CUOPT_URL=... .
+CUOPT_URL="${CUOPT_URL:-http://localhost:5000}"
 
 echo "[FleetMind] Removing any existing isaac-sim container..."
 docker rm -f isaac-sim >/dev/null 2>&1 || true
 
-echo "[FleetMind] Launching streaming scene (publicIp=$PUBLIC_IP)..."
+echo "[FleetMind] Launching streaming scene (publicIp=$PUBLIC_IP, cuopt=$CUOPT_URL)..."
 nohup docker run --name isaac-sim --gpus all --network=host \
   -e "ACCEPT_EULA=Y" -e "PRIVACY_CONSENT=Y" \
   -e "NVIDIA_DRIVER_CAPABILITIES=all" \
   -e "ISAACSIM_HOST=$PUBLIC_IP" \
+  -e "CUOPT_URL=$CUOPT_URL" \
   -v ~/docker/isaac-sim/cache/main:/isaac-sim/.cache:rw \
   -v ~/docker/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache:rw \
   -v ~/docker/isaac-sim/logs:/isaac-sim/.nvidia-omniverse/logs:rw \
