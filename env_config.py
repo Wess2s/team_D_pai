@@ -53,6 +53,7 @@ class VehicleDefaults:
 @dataclass
 class JobsConfig:
     strategy: str = "round_robin"
+    allow_delivered_fallback: bool = True
 
 
 @dataclass
@@ -67,6 +68,8 @@ class CuOptConfig:
 class CbsConfig:
     enabled: bool = True
     max_expansions: int = 500
+    clearance_m: float = 0.0
+    inflate_obstacles: bool = False
 
 
 @dataclass

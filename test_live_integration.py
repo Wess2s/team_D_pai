@@ -25,6 +25,7 @@ from replanner import detect_replan_triggers
 from warehouse_graph import build_graph_from_state, build_warehouse_graph
 from cbs_integration import deconflict_mission, mission_to_grid_checkpoints
 from cbs_executor import plan_execution_events
+from cbs_planner import _detect_first_conflict
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests_fixtures_state.json")
 
@@ -60,6 +61,33 @@ class TestLiveIntegration(unittest.TestCase):
         for job in jobs:
             self.assertTrue(job.pickup_node_id.startswith("WH_Palette_"))
             self.assertTrue(job.delivery_node_id.startswith("stage_"))
+
+    def test_jobs_assign_distinct_zones_no_stacking(self) -> None:
+        # Each staging zone is targeted by at most one pallet (no pallet-on-pallet).
+        _n, _v, jobs = build_nodes_vehicles_jobs(self.state)
+        target_zones = [j.delivery_node_id for j in jobs]
+        self.assertEqual(len(target_zones), len(set(target_zones)))
+
+    def test_jobs_pair_pallet_with_nearest_zone(self) -> None:
+        # No job should send a pallet to a zone when a closer free zone exists in
+        # its own assignment set (greedy-nearest property: sum of chosen distances
+        # is <= the round-robin pairing).
+        import math
+
+        state = self.state
+        _n, _v, jobs = build_nodes_vehicles_jobs(state)
+        pallets = state["pallets"]
+        zones = state["zones"]
+
+        def d(pid: str, zid: str) -> float:
+            p, z = pallets[pid], zones[zid]
+            return math.dist((p["x"], p["y"]), (z["x"], z["y"]))
+
+        chosen = sum(d(j.pallet_id, j.delivery_node_id) for j in jobs)
+        zone_ids = sorted({j.delivery_node_id for j in jobs})
+        pallet_ids = [j.pallet_id for j in jobs]
+        rr = sum(d(p, zone_ids[i % len(zone_ids)]) for i, p in enumerate(pallet_ids))
+        self.assertLessEqual(chosen, rr + 1e-6)
 
     def test_nav_graph_routing_matches_or_exceeds_euclidean(self) -> None:
         nodes, _, _ = build_nodes_vehicles_jobs(self.state)
@@ -166,6 +194,23 @@ class TestLiveIntegration(unittest.TestCase):
         cmds = {e["command"] for e in events}
         self.assertTrue({"pick", "drop"} & cmds)
         self.assertIn("goto", cmds)
+
+    def test_cbs_clearance_keeps_forklifts_apart(self) -> None:
+        # Two agents on distinct, adjacent nodes 1.0 m apart at the same time.
+        coords = {"x": (0.0, 0.0), "y": (1.0, 0.0)}
+        paths = {"A": [("x", 0), ("x", 1)], "B": [("y", 0), ("y", 1)]}
+
+        # No clearance -> point robots -> no conflict (distinct nodes).
+        self.assertIsNone(_detect_first_conflict(paths))
+
+        # 1.5 m footprint clearance -> their bounding boxes overlap -> conflict.
+        conflict = _detect_first_conflict(paths, node_coords=coords, clearance=1.5)
+        self.assertIsNotNone(conflict)
+        self.assertEqual(conflict["type"], "proximity")
+        self.assertEqual(set(conflict["agents"]), {"A", "B"})
+
+        # Clearance below the gap -> allowed again.
+        self.assertIsNone(_detect_first_conflict(paths, node_coords=coords, clearance=0.9))
 
 
 if __name__ == "__main__":

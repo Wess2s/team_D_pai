@@ -4,72 +4,111 @@ This file provides guidance to Claude Code (claude.ai/code) when operating in th
 
 ## Project overview
 
-**team_D_pai — Geo-CBS Fleet Orchestrator.** Natural-language control of an NVIDIA Isaac Sim forklift simulation. Two pipelines converge on the same USD-based sim:
+**team_D_pai — Geo-CBS Fleet Orchestrator.** Natural-language + optimization-driven
+control of an NVIDIA Isaac Sim forklift fleet. All planning modules live at the **repo
+root** (this is the canonical, complete version — the former `codigo_cuopt/` subset has
+been removed).
 
-1. **LLM task pipeline** (root files) — operator text → `llm_task_parser.py` (NVIDIA NIM LLM) → structured `RobotTask` objects → `sim_bridge.py` → TCP socket (`localhost:8765`) → Isaac Sim receiver (`serveractivation.py`).
-2. **cuOpt logistics pipeline** (`codigo_cuopt/`) — warehouse snapshot → graph + distance matrix → cuOpt multi-vehicle routing solver → mission plan (navigate/pickup/dropoff/charge commands) → optional execution simulation.
+The **real** simulation is the FleetMind warehouse (`nvidia-hackathon/scenes/scene_exec.py`),
+which runs headless in Isaac Sim and exposes an **HTTP bridge on `:8080`**
+(`GET /state`, `POST /mission | /goto | /pick | /drop | /home | /block_zone`). The scene
+has 2 forklifts (`AMR_1`, `AMR_2`), 6 pallets (`WH_Palette_01..06`), 3 staging zones
+(`stage_1..3`) and a real nav graph (~249 nodes / 454 edges) surfaced in `/state`.
 
-## Top-level files (root)
+Primary pipeline (drives the real sim):
+
+```
+GET /state ─► live_state_adapter ─► Node/Vehicle/Job (real ids)
+           ─► warehouse_graph.build_graph_from_state (real nav-graph routing)
+           ─► cuopt_adapter (Mock or Http) ─► CuOptOutput
+           ─► mission_translator ─► MissionPlan(NavigationCommand[])
+           ─► cbs_integration.deconflict_mission (CBS over the real grid)
+           ─► isaac_dispatch (POST /mission)  OR  cbs_executor (step /goto)
+```
+
+`fleet_orchestrator.py` is the end-to-end entry point.
+
+## Integration / live-sim modules (root)
 
 | File | Role |
 | --- | --- |
-| `llm_task_parser.py` | LLM task parser — converts natural-language commands to `RobotTask` dataclass lists via NVIDIA NIM (`meta/llama-3.1-8b-instruct`). Defines the `ActionType` enum and system prompt with valid stage identifiers. |
-| `sim_bridge.py` | TCP dispatch layer — translates each `RobotTask` into USD attribute write scripts and sends them over a socket to Isaac Sim's receiver. |
-| `serveractivation.py` | One-time Isaac Sim Script Editor snippet — starts a TCP server inside Isaac Sim that `exec()`s incoming Python on the main thread. |
+| `fleet_orchestrator.py` | **Entry point.** `fetch → build inputs → graph → cuOpt → translate → CBS → dispatch`. CLI flags: `--dry-run`, `--include-busy`, `--objective`, `--jobs`, `--config`, `--execute {mission,cbs}`. |
+| `live_state_adapter.py` | `fetch_state()` (`GET /state`) + `build_nodes_vehicles_jobs()` — turns the live snapshot into cuOpt contracts, reusing real ids (filters busy forklifts / carried / delivered pallets / blocked zones). |
+| `isaac_dispatch.py` | `mission_to_steps()` folds `NavigationCommand`s into `[["pick",p],["drop",z]]`; `dispatch_mission()` POSTs them to `/mission`. |
+| `cbs_integration.py` | `mission_to_grid_checkpoints()` snaps mission stops to real nav-graph nodes; `deconflict_mission()` runs CBS over the real grid; `cbs_dispatch_order()` orders vehicles by CBS finish time. |
+| `cbs_executor.py` | Opt-in faithful executor: `plan_execution_events()` (pure) + `execute_cbs_paths()` steps forklifts through CBS grid paths via `POST /goto`, issuing `/pick`/`/drop` at checkpoints. |
+| `env_config.py` / `fleet_config.json` | External config (base URL, naming conventions, nav-graph usage, vehicle defaults, cuOpt endpoint envs, CBS/replan params). Nothing hardcoded into algorithms. |
 
-## codigo_cuopt/ pipeline
+## cuOpt / CBS planning modules (root)
 
-Data flow: **scene snapshot → warehouse graph → cuOpt input → solver → mission plan → execution report**
+Data flow: **scene snapshot → warehouse graph → cuOpt input → solver → mission plan → CBS → execution**
 
 | File | Responsibility |
 | --- | --- |
-| `logistics_models.py` | Core data contracts — `Node`, `Vehicle`, `Job`, `CuOptInput/Output`, `MissionPlan`, `NavigationCommand`, `ExecutionReport` (all typed dataclasses). The single source of truth for the inter-module API. |
-| `isaac_scene_extractor.py` | Extracts relevant entities (`storage`, `dock`, `charging`, `waypoint`) from an Isaac Sim USD stage; provides `build_mock_warehouse_snapshot()` for offline testing. |
-| `warehouse_graph.py` | Builds a `WarehouseGraph` (node list, index, distance matrix) from nodes with optional blocked edges. |
-| `cuopt_adapter.py` | `build_cuopt_input()` contract + two solver implementations: `MockCuOptAdapter` (deterministic greedy planner with battery/time-window/constraint checks) and `HttpCuOptAdapter` (HTTP POST placeholder for a real cuOpt service). |
+| `logistics_models.py` | Core typed contracts — `Node`, `Vehicle`, `Job`, `CuOptInput/Output`, `MissionPlan`, `NavigationCommand`, `ExecutionReport`. Single source of truth. |
+| `isaac_scene_extractor.py` | `extract_from_state_snapshot(state)` reads the live `/state` (real path); `extract_from_isaac_stage(stage)` reads a USD stage; `build_mock_warehouse_snapshot()` for offline tests. |
+| `warehouse_graph.py` | `build_warehouse_graph()` (euclidean), `build_graph_from_state()` (entity-only, real nav-graph routing via Dijkstra), `build_grid_graph_from_state()` (full grid for CBS), `nearest_grid_node()`. |
+| `cuopt_adapter.py` | `build_cuopt_input()` + `MockCuOptAdapter` (regret-2 insertion + local-search VRPTW heuristic) and `HttpCuOptAdapter` (real NVIDIA cuOpt schema, async submit/poll). |
 | `mission_translator.py` | Converts `CuOptOutput` routes into `NavigationCommand` lists (`navigate`, `pickup`, `dropoff`, `charge`). |
-| `factory_simulator.py` | Simulates execution-time incidents (human crossing, aisle block, low-battery) and produces an `ExecutionReport` KPI. |
-| `cuopt.py` | Orchestrator — wires the full mock pipeline end-to-end; `run_demo_pipeline(scenario)` is the entry point. |
-| `demo_runner.py` | CLI wrapper over `cuopt.py` with scenario selection, ASCII map rendering, and JSON output. Run: `python demo_runner.py --scenario all`. |
-| `demo_visualizer.py` | Route summary + ASCII warehouse map renderer for terminal demos. |
+| `cbs_planner.py` | Full-horizon multi-agent Conflict-Based Search (`plan_checkpoint_cbs`): vertex/edge conflicts, bypass optimization, blocked nodes/edges, human-occupancy windows. |
+| `planner.py` | `run_planner_loop()` — solver select → CBS → mission translate → `route_executor` → replan payload. |
+| `task_allocator.py` | Weighted pre-allocation policy (priority + distance + battery). |
+| `state_manager.py` | Runtime `WorldState` model for agents/jobs/events. |
+| `route_executor.py` | `execute_mission_dry_run()` (simulate) and `execute_mission_on_isaac()` (dispatch to the live sim). |
+| `replanner.py` | `detect_replan_triggers(state)` (path_blocked / object / conflict / blocked zone / pallet moved / low battery) + `build_replan_request()`. |
+| `runtime_config.py` | JSON/env config for `planner.py` (cuOpt service toggle, CBS/replan). |
+| `factory_simulator.py` | Offline incident simulation → `ExecutionReport` KPI. |
+| `cuopt.py` / `demo_runner.py` / `demo_visualizer.py` | Offline mock E2E demo, CLI runner and ASCII visualiser. |
+
+## Legacy / superseded
+
+| File | Status |
+| --- | --- |
+| `llm_task_parser.py` | LLM parser (NVIDIA NIM) → `RobotTask`. Uses old vocab (`blockpallet_*`, `Buffer_*`). Not wired to the live HTTP sim. |
+| `sim_bridge.py`, `serveractivation.py` | **Superseded.** TCP `:8765` + `/World/forklift` USD-attribute bridge — does NOT match the deployed FleetMind scene (HTTP `:8080`, `/World/AMRs/AMR_1`). Kept for reference. |
 
 ## Common development commands
 
 ```bash
-# Run the root LLM pipeline (parser only — needs NVIDIA_API_KEY)
-python llm_task_parser.py
+# Live orchestrator (needs the FleetMind sim on :8080)
+python3 fleet_orchestrator.py --dry-run                 # preview steps, no POST
+python3 fleet_orchestrator.py                           # dispatch idle forklifts
+python3 fleet_orchestrator.py --include-busy            # include non-idle forklifts
+python3 fleet_orchestrator.py --objective min_makespan  # min_distance | min_time | min_makespan
+python3 fleet_orchestrator.py --jobs jobs.json          # [{ "pallet","zone" }] overrides
+python3 fleet_orchestrator.py --execute cbs             # step CBS grid paths via /goto
 
-# Run the root dispatch pipeline (needs Isaac Sim receiver on port 8765)
-python sim_bridge.py
+# Offline mock E2E demo (no Isaac)
+python3 cuopt.py
+python3 demo_runner.py --scenario all
 
-# Run the cuOpt mock E2E demo
-python codigo_cuopt/cuopt.py
-
-# Run all cuOpt scenarios with ASCII maps
-python codigo_cuopt/demo_runner.py --scenario all
-
-# Save scenario JSON outputs
-python codigo_cuopt/demo_runner.py --scenario all --json-out demo_outputs
-
-# Run unittest suite (in codigo_cuopt/)
-cd codigo_cuopt && python -m unittest -v
+# Tests (all offline; test_live_integration uses a captured /state fixture)
+python3 -m unittest test_cuopt_flow test_cuopt_adapter test_cbs_planner test_live_integration -v
 ```
 
-## Key configuration constants
+## Key configuration
 
-**sim_bridge.py**: `ISAAC_SIM_PORT=8765`, `FORKLIFT_PATH="/World/forklift"`, `TIMEOUT_S=10`
+**fleet_config.json** (loaded by `env_config.load_fleet_config`): `base_url` (default
+`http://localhost:8080`), `naming` (prim/id conventions), `graph.use_nav_graph`,
+`vehicles` (speed/capacity/battery defaults — the live telemetry has **no** battery),
+`cuopt.endpoint_env`/`api_key_env`, `cbs`, `replan`.
 
-**llm_task_parser.py**: Model is `meta/llama-3.1-8b-instruct` (deterministic via `temperature=0`). Valid pallets, drop areas, and robots are hardcoded in `_SYSTEM_PROMPT`.
+**Real cuOpt:** set `CUOPT_URL` (+ optional `CUOPT_API_KEY`) → `HttpCuOptAdapter`;
+otherwise `MockCuOptAdapter`.
 
-**cuOpt contracts** (logistics_models.py):
-- Node types: `storage`, `dock`, `charging`, `waypoint`, `depot`
-- Objectives: `min_distance`, `min_time`, `min_makespan`
-- Vehicle fields include battery capacity, energy/meter, time windows, max shift
-- Jobs have pickup/delivery time windows and priority
+**cuOpt contracts** (logistics_models.py): Node types `storage`/`dock`/`charging`/`waypoint`/`depot`;
+objectives `min_distance`/`min_time`/`min_makespan`.
 
 ## Architecture notes
 
-- The **RobotTask schema** in the LLM pipeline (root) is a simple action dispatcher — each task maps directly to USD attribute writes on the `/World/forklift` prim. There is no multi-robot coordination.
-- The **cuOpt pipeline** (`codigo_cuopt/`) handles multi-vehicle routing with battery constraints, time windows, node occupancy reservations, and blocked edges. It produces per-vehicle command lists that are *intended* to be fed into the same Isaac Sim bridge or a separate fleet controller.
-- `MockCuOptAdapter` is greedy (priority-sorted job assignment) with incremental cost estimation and rollback — not an exact solver. Replace with `HttpCuOptAdapter` when a real cuOpt endpoint is available; keep the internal contracts (`CuOptInput`/`CuOptOutput`) unchanged.
+- The orchestrator sends only **semantic** targets to `/mission`; the sim's bridge does the
+  A* routing internally. For dispatch, entity ids are reused as cuOpt ids (`AMR_1`,
+  `WH_Palette_01`, `stage_1`) so no name translation is needed.
+- **CBS** runs over the **real** nav grid (`build_grid_graph_from_state`), so vertex/edge
+  conflicts are resolved on actual aisles. In the default `--execute mission` mode CBS output
+  orders/staggers dispatch (advisory). `--execute cbs` steps grid nodes via `/goto` to honour
+  the deconflicted timing (best-effort: sim motion is continuous, so CBS timesteps act as an
+  ordering barrier, not exact seconds).
+- **No battery telemetry** in the real scene — battery values come from config and are
+  advisory; `detect_replan_triggers` never false-positives on it.
 - USD files (`forklift.usd`, `omniverse3_0.usd`) are binary crates — open in Isaac Sim / USD toolbox.

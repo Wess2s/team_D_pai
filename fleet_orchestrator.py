@@ -91,6 +91,7 @@ def run(
         include_busy=include_busy,
         vehicle_speed_mps=cfg.vehicles.speed_mps,
         vehicle_capacity=cfg.vehicles.capacity,
+        allow_delivered_fallback=cfg.jobs.allow_delivered_fallback,
     )
 
     graph, graph_kind = _build_graph(state, nodes, cfg)
@@ -110,7 +111,12 @@ def run(
     # Conflict-Based Search over the real nav grid (deconfliction + ordering).
     cbs_summary: dict = {"status": "skipped"}
     if cfg.cbs.enabled:
-        cbs_result = deconflict_mission(mission_dict, state, max_expansions=cfg.cbs.max_expansions)
+        cbs_result = deconflict_mission(
+            mission_dict, state,
+            max_expansions=cfg.cbs.max_expansions,
+            clearance_m=cfg.cbs.clearance_m,
+            inflate_obstacles=cfg.cbs.inflate_obstacles,
+        )
         mission_dict = _order_dispatch(mission_dict, cbs_dispatch_order(cbs_result))
         cbs_summary = {
             "status": cbs_result.get("status"),

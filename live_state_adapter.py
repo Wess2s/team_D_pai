@@ -69,28 +69,88 @@ def _open_zones(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _not_carried_pallets(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """All pallets not currently on a fork (delivered ones included)."""
+    return {
+        pid: info
+        for pid, info in (state.get("pallets") or {}).items()
+        if not info.get("carried_by")
+    }
+
+
+def _assign_distinct_zones(
+    pallets: dict[str, dict[str, Any]],
+    zones: dict[str, dict[str, Any]],
+    *,
+    avoid_current: bool = False,
+) -> list[dict[str, str]]:
+    """Bijective pallet->zone assignment minimising travel (greedy nearest).
+
+    Each zone is used at most once (no stacking) and each pallet is paired with
+    its closest still-free zone (no cross-room trips). When ``avoid_current`` is
+    set, a pallet is not re-assigned to the zone it already sits on (used for the
+    delivered-pallet recycle so the move is actually visible). If more pallets
+    than zones exist, only ``len(zones)`` jobs are produced — the rest stay put
+    rather than being stacked.
+    """
+    import math
+
+    def dist(pid: str, zid: str) -> float:
+        p, z = pallets[pid], zones[zid]
+        return math.dist((float(p["x"]), float(p["y"])), (float(z["x"]), float(z["y"])))
+
+    current_zone: dict[str, str] = {}
+    if avoid_current and zones:
+        for pid in pallets:
+            current_zone[pid] = min(zones, key=lambda zid, _p=pid: dist(_p, zid))
+
+    candidates = sorted(
+        (dist(pid, zid), pid, zid) for pid in pallets for zid in zones
+    )
+    used_p: set[str] = set()
+    used_z: set[str] = set()
+    pairs: list[dict[str, str]] = []
+    for _d, pid, zid in candidates:
+        if pid in used_p or zid in used_z:
+            continue
+        if avoid_current and current_zone.get(pid) == zid:
+            continue
+        pairs.append({"pallet": pid, "zone": zid})
+        used_p.add(pid)
+        used_z.add(zid)
+    return sorted(pairs, key=lambda j: j["pallet"])
+
+
 def build_jobs_spec(
     state: dict[str, Any],
     job_spec: list[dict[str, str]] | None = None,
+    *,
+    allow_delivered_fallback: bool = True,
 ) -> list[dict[str, str]]:
     """Resolve the pickup/delivery job list.
 
     If ``job_spec`` is given it is used verbatim (each item ``{"pallet","zone"}``).
-    Otherwise a default demo spec distributes every available pallet round-robin
-    across the open staging zones.
+    Otherwise each available (not-yet-delivered) pallet is paired with its nearest
+    *distinct* open staging zone — so no two pallets target the same zone (no
+    stacking) and no pallet is dragged across the room. When everything is already
+    delivered and ``allow_delivered_fallback`` is set, delivered pallets are
+    re-cycled to their nearest *other* zone so the scene keeps working.
     """
     if job_spec:
         return job_spec
 
-    pallets = sorted(_available_pallets(state).keys())
-    zones = sorted(_open_zones(state).keys())
-    if not pallets or not zones:
+    zones = _open_zones(state)
+    if not zones:
         return []
 
-    return [
-        {"pallet": pallet, "zone": zones[i % len(zones)]}
-        for i, pallet in enumerate(pallets)
-    ]
+    available = _available_pallets(state)
+    if available:
+        return _assign_distinct_zones(available, zones)
+
+    if not allow_delivered_fallback:
+        return []
+
+    return _assign_distinct_zones(_not_carried_pallets(state), zones, avoid_current=True)
 
 
 def build_nodes_vehicles_jobs(
@@ -100,6 +160,7 @@ def build_nodes_vehicles_jobs(
     include_busy: bool = False,
     vehicle_speed_mps: float = 1.2,
     vehicle_capacity: float = 1.0,
+    allow_delivered_fallback: bool = True,
 ) -> tuple[list[Node], list[Vehicle], list[Job]]:
     """Convert a live ``/state`` snapshot into cuOpt solver inputs.
 
@@ -111,7 +172,7 @@ def build_nodes_vehicles_jobs(
     if not forklifts:
         raise ValueError("No available (idle) forklifts found in /state")
 
-    resolved_jobs = build_jobs_spec(state, job_spec)
+    resolved_jobs = build_jobs_spec(state, job_spec, allow_delivered_fallback=allow_delivered_fallback)
     if not resolved_jobs:
         raise ValueError("No jobs could be built (no available pallets or open zones)")
 

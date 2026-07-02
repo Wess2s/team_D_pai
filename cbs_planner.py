@@ -200,6 +200,8 @@ def _node_at_time(path: list[tuple[str, int]], time_step: int) -> str:
 def _detect_first_conflict(
     paths: dict[str, list[tuple[str, int]]],
     multi_capacity_nodes: set[str] | None = None,
+    node_coords: dict[str, tuple[float, float]] | None = None,
+    clearance: float = 0.0,
 ) -> dict[str, Any] | None:
     if not paths:
         return None
@@ -242,6 +244,28 @@ def _detect_first_conflict(
                         "edge_a2": (a2_prev, a2_curr),
                         "agents": [a1, a2],
                     }
+
+        # Proximity (footprint) conflicts: two agents at distinct nodes whose
+        # centre-to-centre distance is below the forklift clearance overlap their
+        # bounding boxes even though they are not on the same node. Modelled as a
+        # per-agent vertex conflict so the existing branching resolves it.
+        if node_coords and clearance > 0.0:
+            for i, a1 in enumerate(agent_ids):
+                for a2 in agent_ids[i + 1 :]:
+                    n1 = _node_at_time(paths[a1], t)
+                    n2 = _node_at_time(paths[a2], t)
+                    if n1 == n2 or n1 in multi_capacity_nodes or n2 in multi_capacity_nodes:
+                        continue
+                    if n1 not in node_coords or n2 not in node_coords:
+                        continue
+                    if math.dist(node_coords[n1], node_coords[n2]) < clearance:
+                        return {
+                            "type": "proximity",
+                            "time": t,
+                            "node_a1": n1,
+                            "node_a2": n2,
+                            "agents": [a1, a2],
+                        }
     return None
 
 
@@ -263,6 +287,8 @@ def plan_checkpoint_cbs(
     blocked_edges: list[tuple[str, str]] | None = None,
     human_occupancy: dict[str, list[tuple[int, int]]] | None = None,
     config: CBSConfig | None = None,
+    node_coords: dict[str, tuple[float, float]] | None = None,
+    clearance: float = 0.0,
 ) -> dict[str, Any]:
     """Full-horizon Conflict-Based Search over each agent's complete
     checkpoint sequence (all pickups/deliveries/charging stops), not one
@@ -354,7 +380,10 @@ def plan_checkpoint_cbs(
         expansions += 1
         best_effort_paths = current.paths
 
-        conflict = _detect_first_conflict(current.paths, multi_capacity_nodes=multi_capacity_nodes)
+        conflict = _detect_first_conflict(
+            current.paths, multi_capacity_nodes=multi_capacity_nodes,
+            node_coords=node_coords, clearance=clearance,
+        )
         if conflict is None:
             return {
                 "status": "success",
@@ -376,6 +405,11 @@ def plan_checkpoint_cbs(
                 new_constraints.append(
                     CBSConstraint(agent_id=constrained_agent, time_step=conflict["time"], node_id=conflict["node"])
                 )
+            elif conflict["type"] == "proximity":
+                node = conflict["node_a1"] if constrained_agent == a1 else conflict["node_a2"]
+                new_constraints.append(
+                    CBSConstraint(agent_id=constrained_agent, time_step=conflict["time"], node_id=node)
+                )
             else:
                 edge = conflict["edge_a1"] if constrained_agent == a1 else conflict["edge_a2"]
                 new_constraints.append(
@@ -392,7 +426,10 @@ def plan_checkpoint_cbs(
             if cfg.use_bypass and not bypassed and new_cost <= old_cost:
                 bypass_paths = dict(current.paths)
                 bypass_paths[constrained_agent] = replanned
-                bypass_conflict = _detect_first_conflict(bypass_paths, multi_capacity_nodes=multi_capacity_nodes)
+                bypass_conflict = _detect_first_conflict(
+                    bypass_paths, multi_capacity_nodes=multi_capacity_nodes,
+                    node_coords=node_coords, clearance=clearance,
+                )
                 if not _conflicts_match(bypass_conflict, conflict):
                     # Same-cost reroute that no longer reproduces this exact
                     # conflict: keep it without permanently constraining the

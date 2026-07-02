@@ -78,6 +78,8 @@ def deconflict_mission(
     *,
     human_occupancy: dict[str, list[tuple[int, int]]] | None = None,
     max_expansions: int = 500,
+    clearance_m: float = 0.0,
+    inflate_obstacles: bool = False,
 ) -> dict[str, Any]:
     """Run CBS over the real grid for a solved mission.
 
@@ -97,7 +99,31 @@ def deconflict_mission(
         }
 
     blocked_nodes = blocked_grid_nodes_from_state(state)
+
     grid = build_grid_graph_from_state(state, blocked_nodes=set(blocked_nodes))
+    node_coords = {n.id: (float(n.x), float(n.y)) for n in grid.nodes}
+
+    # Footprint-aware obstacle inflation: block grid nodes within the forklift
+    # clearance of a static pallet, except the checkpoint nodes the mission must
+    # actually reach (so pickups/drops stay feasible).
+    if inflate_obstacles and clearance_m > 0.0:
+        import math
+
+        keep = {n for nodes in checkpoints.values() for n in nodes}
+        pallet_xy = [
+            (float(p["x"]), float(p["y"]))
+            for p in (state.get("pallets") or {}).values()
+            if not p.get("carried_by")
+        ]
+        inflated = {
+            nid
+            for nid, (nx, ny) in node_coords.items()
+            if nid not in keep and any(math.dist((nx, ny), pxy) < clearance_m for pxy in pallet_xy)
+        }
+        if inflated:
+            blocked_nodes = list(set(blocked_nodes) | inflated)
+            grid = build_grid_graph_from_state(state, blocked_nodes=set(blocked_nodes))
+            node_coords = {n.id: (float(n.x), float(n.y)) for n in grid.nodes}
 
     result = plan_checkpoint_cbs(
         checkpoints=checkpoints,
@@ -106,6 +132,8 @@ def deconflict_mission(
         blocked_nodes=blocked_nodes,
         human_occupancy=human_occupancy or {},
         config=CBSConfig(max_expansions=max_expansions),
+        node_coords=node_coords,
+        clearance=clearance_m,
     )
     result["actions"] = actions
     result["checkpoints"] = checkpoints

@@ -27,7 +27,8 @@
   },
 
   "jobs": {
-    "strategy": "round_robin"
+    "strategy": "round_robin",
+    "allow_delivered_fallback": true
   },
 
   "cuopt": {
@@ -39,7 +40,9 @@
 
   "cbs": {
     "enabled": true,
-    "max_expansions": 500
+    "max_expansions": 500,
+    "clearance_m": 1.5,
+    "inflate_obstacles": false
   },
 
   "replan": {

@@ -1,20 +1,29 @@
 # team_D_pai — Geo-CBS Fleet Orchestrator
 
-Natural-language control of an NVIDIA **Isaac Sim** forklift simulation. An operator
-types a plain-English command (e.g. *"move blockpallet_a09 one metre to the left"*),
-an LLM converts it into structured robot tasks, and those tasks are pushed into a
-running Isaac Sim instance where they drive a forklift robot via USD attributes.
+Optimization-driven control of an NVIDIA **Isaac Sim** forklift fleet. cuOpt plans the
+missions, CBS deconflicts them over the real navigation graph, and the plan is dispatched
+to a **running** Isaac Sim scene that drives the forklifts.
 
-This repository now contains a minimum but extensible pipeline for logistics planning:
+The real simulation is the **FleetMind** warehouse (`nvidia-hackathon/scenes/scene_exec.py`),
+which runs headless and exposes an **HTTP bridge on `:8080`**. It has 2 forklifts
+(`AMR_1`, `AMR_2`), 6 pallets (`WH_Palette_01..06`), 3 staging zones (`stage_1..3`) and a
+real nav graph (~249 nodes / 454 edges) surfaced in `GET /state`.
 
-Natural language/UI command
--> Planner
--> Logical logistics jobs
--> Warehouse graph abstraction from Isaac Sim
--> cuOpt input
--> cuOpt route solution
--> Mission plan
--> Isaac Sim navigation commands / visualization
+Live pipeline (drives the real sim):
+
+```
+GET /state
+ -> live_state_adapter        (Node/Vehicle/Job, real ids)
+ -> warehouse_graph           (routing over the real nav graph)
+ -> cuOpt input
+ -> cuOpt route solution      (Mock or real Http adapter)
+ -> mission plan
+ -> CBS deconfliction         (over the real grid)
+ -> POST /mission | /goto     (forklifts move)
+```
+
+`fleet_orchestrator.py` is the end-to-end entry point. All planning modules live at the
+**repo root** (canonical; the former `codigo_cuopt/` duplicate was removed).
 
 ## Key Principle
 
@@ -30,12 +39,35 @@ Isaac Sim remains the source of physical truth and visualization, but cuOpt rece
 
 ## Modules
 
+### Live Isaac Sim integration (FleetMind, HTTP :8080)
+
+- `fleet_orchestrator.py`
+  - **entry point**: `fetch /state -> build inputs -> graph -> cuOpt -> translate -> CBS -> dispatch`
+  - CLI: `--dry-run`, `--include-busy`, `--objective`, `--jobs`, `--config`, `--execute {mission,cbs}`
+- `live_state_adapter.py`
+  - `fetch_state()` and `build_nodes_vehicles_jobs()` — live `/state` snapshot into cuOpt
+    contracts, reusing real ids (filters busy forklifts / carried / delivered / blocked)
+- `isaac_dispatch.py`
+  - folds `NavigationCommand`s into `[["pick",p],["drop",z]]` and POSTs them to `/mission`
+- `cbs_integration.py`
+  - snaps mission stops to real nav-graph nodes and runs CBS over the real grid
+    (`deconflict_mission`, `cbs_dispatch_order`)
+- `cbs_executor.py`
+  - opt-in faithful executor: steps forklifts through CBS grid paths via `POST /goto`
+- `env_config.py` / `fleet_config.json`
+  - external config (base URL, naming, nav-graph usage, vehicle defaults, cuOpt endpoint, CBS/replan)
+
+### Planning core
+
 - `isaac_scene_extractor.py`
   - extracts relevant scene entities from Isaac Sim stage into a lightweight snapshot
-  - includes `build_mock_warehouse_snapshot()` for local testing without Isaac runtime
+  - `extract_from_state_snapshot()` reads the live `/state`; `extract_from_isaac_stage()`
+    reads a USD stage; `build_mock_warehouse_snapshot()` for local testing without Isaac
 
 - `warehouse_graph.py`
   - builds the logical graph and distance matrix
+  - `build_graph_from_state()` routes over the real nav graph; `build_grid_graph_from_state()`
+    builds the full grid CBS runs on; `build_warehouse_graph()` is the euclidean fallback
 
 - `cuopt_adapter.py`
   - `build_cuopt_input()` creates the solver input contract
@@ -112,6 +144,11 @@ Isaac Sim remains the source of physical truth and visualization, but cuOpt rece
 | [forklift.usd](forklift.usd) | USD (binary crate) asset for the forklift robot. |
 | [omniverse3_0.usd](omniverse3_0.usd) | USD (binary crate) scene/stage. |
 | README.md | This document. |
+
+> **Note:** [sim_bridge.py](sim_bridge.py), [serveractivation.py](serveractivation.py) and
+> [llm_task_parser.py](llm_task_parser.py) are the **legacy** TCP `:8765` / `/World/forklift`
+> path and are **superseded** by the HTTP `:8080` integration above (the deployed FleetMind
+> scene uses `/World/AMRs/AMR_1`, not `/World/forklift`). They are kept for reference.
 
 ## How it works
 
@@ -241,22 +278,40 @@ Run CBS-focused tests only:
 python -m unittest -v test_cbs_planner.py
 ```
 
+## Run the live orchestrator
+
+With the FleetMind sim running on `:8080`:
+
+```bash
+python3 fleet_orchestrator.py --dry-run                 # preview mission steps, no POST
+python3 fleet_orchestrator.py                           # dispatch idle forklifts
+python3 fleet_orchestrator.py --include-busy            # include non-idle forklifts
+python3 fleet_orchestrator.py --objective min_makespan  # min_distance | min_time | min_makespan
+python3 fleet_orchestrator.py --jobs jobs.json          # [{ "pallet","zone" }] overrides
+python3 fleet_orchestrator.py --execute cbs             # step CBS grid paths via /goto
+```
+
+Tune the base URL, naming, nav-graph usage, vehicle defaults and CBS/replan params in
+[fleet_config.json](fleet_config.json) (or pass `--config`). Offline tests use a captured
+`/state` fixture and need no Isaac:
+
+```bash
+python3 -m unittest test_cuopt_flow test_cuopt_adapter test_cbs_planner test_live_integration -v
+```
+
 ## Next Step for Real cuOpt
 
 `HttpCuOptAdapter` already speaks the real NVIDIA cuOpt request/response
-schema. To switch on it:
+schema. The live orchestrator selects it automatically when `CUOPT_URL` is set:
 
 ```bash
-export CUOPT_ENDPOINT="https://<your-cuopt-host>"
-export CUOPT_API_KEY="<key>"
-export CUOPT_ENABLED=true
-python cuopt.py
+export CUOPT_URL="https://<your-cuopt-host>"
+export CUOPT_API_KEY="<key>"        # optional
+python3 fleet_orchestrator.py
 ```
 
-or set `cuopt.endpoint` / `cuopt.enabled` / `cuopt.api_key_env` in
-`runtime_config.json`. `planner.py` selects between `HttpCuOptAdapter` and
-`MockCuOptAdapter` automatically based on that config; the rest of the
-pipeline (CBS, mission translator, execution) is unaffected either way.
+For the offline demo (`planner.py` / `cuopt.py`) set `cuopt.endpoint` /
+`cuopt.enabled` / `cuopt.api_key_env` in `runtime_config.json` instead;
 
 ## NVIDIA NIM Integration
 
