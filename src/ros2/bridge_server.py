@@ -32,6 +32,7 @@ import os
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.responses import Response as _Response
 
 BACKEND = os.getenv("SIM_BACKEND", "mock").lower()   # mock | isaac
 
@@ -148,6 +149,16 @@ def block_zone(req: ZoneReq) -> dict:
     return _sim.block_zone(req.zone, req.kind)
 
 
+@app.post("/reset")
+def reset() -> dict:
+    """Reset the scene to its start state for a fresh demo (pallets restocked, forklifts
+    home, hazards cleared) without restarting the backend. Also clears the cached plan so
+    the console overlay starts blank."""
+    from ..agent import tools
+    tools.LAST_PLAN = None
+    return _sim.reset()
+
+
 @app.post("/chat")
 def chat(req: ChatReq) -> dict:
     """Operator natural-language command → GenAI agent → tool calls on this sim."""
@@ -162,7 +173,20 @@ def chat(req: ChatReq) -> dict:
 # --------------------------------------------------------------------------- #
 # Static operator console (served at / — the mission-control UI).
 # Mounted last so the API routes above always take precedence.
+#
+# No-cache: the console HTML/JS/CSS is redeployed between demos; without this the
+# browser serves stale assets (missing new buttons, old stream code). Force the
+# browser to revalidate every load so a plain refresh always picks up new UI.
 # --------------------------------------------------------------------------- #
+class _NoCacheStatic(StaticFiles):
+    async def get_response(self, path, scope):
+        resp: _Response = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
+
+
 if os.path.isdir(WEB_DIR):
-    app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="console")
+    app.mount("/", _NoCacheStatic(directory=WEB_DIR, html=True), name="console")
 

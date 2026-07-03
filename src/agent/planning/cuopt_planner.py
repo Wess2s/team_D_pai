@@ -31,13 +31,13 @@ except Exception:  # requests optional off-DGX
 # charge per metre, so its remaining travel range in metres is battery% * RANGE_PER_PCT.
 # cuOpt uses that as each vehicle's max route cost, and penalises low charge so the fuller
 # truck is preferred — i.e. it optimises travel cost AND preserves fleet battery. The
-# drain (0.8 m per 1%, == 1.25%/m in the sim) keeps charge visibly meaningful yet still
-# lets a FULL truck complete the whole job on one charge (100% -> 80 m range covers a lone
-# truck clearing every pallet, ~57 m, with headroom for roadmap detours), while a part-used
-# truck is genuinely out-ranged by a full one (40% -> 32 m can't take the big tour), so
-# cuOpt swaps to the fuller truck and the low one is sent to charge.
-BATTERY_RANGE_PER_PCT = 0.8     # metres of range per 1% charge (== 1 / 1.25
-BATTERY_RANGE_PER_PCT = 0.8     # metres of range per 1% charge (== 1 / 1.25%/m)
+# drain (0.5 m per 1%, == 2.0%/m in the sim) makes charge fall fast enough that the busiest
+# truck in a multi-pallet dispatch ends ~20% — below LOW_BATTERY — so on the NEXT dispatch
+# cuOpt holds it back and sends it to charge while the fuller truck takes the work. A lone
+# truck clearing EVERY pallet (~57 m) now exceeds its 50 m full range, so cuOpt splits the
+# job across both trucks instead of solo-routing one. Busiest split leg (~40 m) < 50 m so no
+# truck strands mid-tour.
+BATTERY_RANGE_PER_PCT = 0.5     # metres of range per 1% charge (== 1 / 2.0%/m)
 BATTERY_PREF_WEIGHT   = 0.4     # fixed-cost penalty per 1% of missing charge
 LOW_BATTERY           = 40.0    # below this a truck is held back and sent to recharge
 

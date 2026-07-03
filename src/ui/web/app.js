@@ -88,6 +88,31 @@ async function health() {
   } catch {}
 }
 
+// Reset the scene for a fresh demo (pallets restocked, forklifts home, hazards cleared)
+// WITHOUT restarting the backend, so the Live 3D stream stays connected between runs.
+async function resetScene() {
+  const btn = document.getElementById("resetBtn");
+  if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+  try {
+    const r = await fetch("/reset", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error("reset rejected");
+    // Clear local render state; the /state + /plan polls refill from the fresh scene.
+    for (const v of Object.values(view)) v.trail = [];
+    plan = null; renderPlanPanel();
+    prevDelivered = new Set();
+    for (const k in prevPhase) delete prevPhase[k];
+    for (const k in hazardBorn) delete hazardBorn[k];
+    logEvent(NV, "<b>Scene reset</b> · fresh demo ready");
+  } catch (e) {
+    logEvent(RED, "Reset failed — is the bridge running?");
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+  }
+}
+
 // cuOpt + CBS plan (the last dispatched optimisation). Polled slowly; it only
 // changes when the operator asks the agent to optimise/clear the fleet.
 async function pollPlan() {
@@ -177,9 +202,16 @@ function frame(now) {
   const dt = Math.min(0.05, (now - lastT) / 1000);
   lastT = now;
 
-  // smooth view states toward latest snapshot
-  const k = 1 - Math.exp(-dt / SMOOTH_TAU);
-  if (snap) {
+  // While Live 3D is the active view the 2D map is hidden, yet its 60fps canvas
+  // redraw would keep saturating the main thread and starve the WebRTC video
+  // decode/compositing — enough to freeze the whole tab in Safari. Pause the
+  // expensive smoothing + draw while streaming; keep the cheap DOM telemetry
+  // (clock/KPIs) ticking so the console still reads as live.
+  const mapVisible = !STREAM.requested;
+
+  if (mapVisible && snap) {
+    // smooth view states toward latest snapshot
+    const k = 1 - Math.exp(-dt / SMOOTH_TAU);
     for (const [name, fk] of Object.entries(snap.forklifts || {})) {
       const v = view[name]; if (!v) continue;
       v.x += (fk.x - v.x) * k;
@@ -196,7 +228,7 @@ function frame(now) {
     }
   }
 
-  draw(now);
+  if (mapVisible) draw(now);
   animateKpis(dt);
   updateClock();
   requestAnimationFrame(frame);
@@ -974,6 +1006,8 @@ async function startStream() {
   try {
     if (!STREAM.streamer) {
       const mod = await import("./vendor/omniverse-webrtc-streaming-library.js");
+      // AppStreamer.connect is a STATIC method — use the class directly, never `new`.
+      // (An instance has no `connect`, so `new AppStreamer()` silently fails to stream.)
       STREAM.streamer = mod.AppStreamer;
       STREAM.StreamType = mod.StreamType;
     }
@@ -987,7 +1021,7 @@ async function startStream() {
       signalingPort: STREAM.signalingPort,
       mediaServer: STREAM.host,
       nativeTouchEvents: true,
-      width: 1920, height: 1080, fps: 60,
+      width: 1280, height: 720, fps: 30,
       onUpdate: (m) => { /* status stream */ },
       onStart: (m) => {
         if (m && m.action === "start" && m.status === "success") {
@@ -1066,6 +1100,8 @@ function initStageToggle() {
     b.addEventListener("click", () => setStageView(b.dataset.view)));
   const retry = document.getElementById("streamRetry");
   if (retry) retry.addEventListener("click", () => { STREAM.connecting = false; startStream(); });
+  const rst = document.getElementById("resetBtn");
+  if (rst) rst.addEventListener("click", resetScene);
   // Release Isaac's single WebRTC client slot cleanly when the console closes.
   window.addEventListener("pagehide", stopStream);
 }

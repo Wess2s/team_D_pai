@@ -64,6 +64,7 @@ class FleetBus:
         self.zones: dict[str, dict] = {}     # zone id   -> {x,y,blocked}
         self.graph: dict = {"nodes": {}, "edges": []}
         self.t0 = time.time()
+        self.reset_epoch = 0                 # bumps when a between-demo reset is requested
 
     # ---- registration ---------------------------------------------------- #
     def register_forklift(self, name: str, x: float, y: float, yaw: float = 0.0) -> None:
@@ -114,6 +115,13 @@ class FleetBus:
 
     def elapsed(self) -> float:
         return time.time() - self.t0
+
+    def request_reset(self) -> None:
+        """Signal a between-demo reset. The scene controller watches `reset_epoch` and,
+        when it changes, teleports every pallet/forklift prim back to its spawn pose — so
+        the scene resets in place without restarting Isaac (keeping the live stream up)."""
+        with self._lock:
+            self.reset_epoch += 1
 
 
 # Module-level singleton shared across the Kit process.

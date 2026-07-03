@@ -89,6 +89,11 @@ def block_zone(zone: str, kind: str = "spill") -> dict:
     return _post("/block_zone", {"zone": zone, "kind": kind})
 
 
+def reset() -> dict:
+    """Reset the scene to its start state for a fresh demo."""
+    return _post("/reset", {})
+
+
 if __name__ == "__main__":
     print("bridge reachable:", health())
     if health():

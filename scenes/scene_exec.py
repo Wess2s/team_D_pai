@@ -110,12 +110,13 @@ TURN_RATE     = math.radians(140.0) # rad/s max yaw slew toward travel heading
 # sits idle at (near) its home charger it trickles back up. cuOpt reads the live % from
 # the snapshot and (a) won't route a truck past its remaining range and (b) prefers the
 # more-charged truck — see cuopt_planner. BATTERY_DRAIN_PER_M must match the planner's
-# BATTERY_RANGE_PER_PCT (range = battery / drain, i.e. 1/0.8). Drain is steep enough that
-# the fleet's charge visibly matters — a partly-used truck can be out-ranged by a full one
-# — yet a full truck can still finish the whole job on one charge, so cuOpt's battery-aware
-# selection is demonstrable without stranding a truck mid-tour.
+# BATTERY_RANGE_PER_PCT (range = battery / drain, i.e. 1/0.5). Drain is steep enough that
+# the busiest truck in a multi-pallet dispatch visibly crosses the low-battery threshold
+# (ends ~20%) so cuOpt then holds it back to recharge on the next dispatch — yet it never
+# strands mid-tour (full range 50 m > the ~40 m busiest split leg). A lone truck clearing
+# EVERY pallet (~57 m) now exceeds one charge, so cuOpt splits/holds instead of solo-routing.
 BATTERY_FULL         = 100.0
-BATTERY_DRAIN_PER_M  = 1.25         # % of charge spent per metre driven (== 1 / 0.8 m/%)
+BATTERY_DRAIN_PER_M  = 2.0          # % of charge spent per metre driven (== 1 / 0.5 m/%)
 BATTERY_CHARGE_PER_S = 10.0         # % regained per second while idle on the charger
 BATTERY_CHARGE_RADIUS = 1.5         # m from home within which charging happens
 # The rigged model's visual forward (fork direction) is offset from the articulation
@@ -1168,6 +1169,41 @@ def _carry_follow(c, x, y, yaw):
             _move_prim_xy(_RT["stage"], c["payload_path"], fx, fy, c["lift"] + PALLET_TOP_Z)
 
 
+def _apply_reset():
+    """Controller half of a between-demo reset: teleport every pallet + its cargo box back
+    to its rack cell and return each forklift to its home charger with a full battery. The
+    bridge has already reset the shared bus; this restores the USD prims so the 3D scene
+    visibly returns to its start state with no Isaac relaunch (the live stream stays up)."""
+    stage = _RT["stage"]
+    for i, (x, y) in enumerate(PALLETS):
+        pp = f"/World/Pallets/Pallet_{i:02d}"
+        _set_pallet_kinematic(stage, pp, True)      # re-arm as kinematic (safe if already)
+        _move_prim_xy(stage, pp, x, y, PALLET_FLOOR_Z)
+        yp = f"/World/Payloads/Payload_{i:02d}"
+        _move_prim_xy(stage, yp, x, y, PALLET_TOP_Z + PAYLOAD_DROP)
+    for name, c in _RT.get("ctrls", {}).items():
+        hx, hy = c["home"]
+        hyaw = c["home_yaw"]
+        c["phase"] = "idle"
+        c["cx"], c["cy"], c["cyaw"] = hx, hy, hyaw
+        c["last_xy"] = None
+        c["lift"] = 0.0
+        c["carrying"] = None
+        c["carry_path"] = None
+        c["payload_path"] = None
+        c["legs"] = []
+        c["leg_i"] = 0
+        c["wp_i"] = 0
+        c["k"] = 0
+        c["battery"] = BATTERY_FULL
+        # Sync our command cursor so the just-cleared bus mission is not re-adopted.
+        c["seq"] = _BUS.get_command(name).seq
+        _set_base_pose(c, hx, hy, hyaw)
+        _publish(name, c, hx, hy, hyaw, 0.0, None, [])
+        _update_route_overlay(stage, name, [])
+    _log("[FleetMind] Scene reset: pallets restocked, forklifts home, batteries full.")
+
+
 def _active_route_pts(c, x, y):
     """Remaining route to draw as the red floor line: the truck's current position
     followed by the not-yet-reached waypoints of every remaining leg. Empty when idle."""
@@ -1187,6 +1223,13 @@ def _on_step(dt):
         return
     if "ctrls" not in _RT:
         _init_controllers()
+        return
+    # Between-demo reset: when the bridge bumps the bus epoch, snap every prim back to its
+    # spawn pose (pallets on racks, forklifts home, batteries full) without an Isaac relaunch.
+    ep = getattr(_BUS, "reset_epoch", 0)
+    if _RT.get("reset_epoch", 0) != ep:
+        _RT["reset_epoch"] = ep
+        _apply_reset()
         return
     if not _RT.get("wp_drawn"):
         # Bridge publishes the graph after build(); draw the node dots once it's up.

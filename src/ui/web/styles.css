@@ -312,6 +312,17 @@ body {
   color: #06090c;
   background: linear-gradient(150deg, var(--nv), var(--nv-dim));
 }
+.reset-btn {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .08em; text-transform: uppercase;
+  color: var(--mute); background: rgba(7,11,17,.78);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 6px 13px; cursor: pointer; backdrop-filter: blur(6px);
+  transition: color .18s, border-color .18s, background .18s;
+}
+.reset-btn:hover { color: var(--ink); border-color: var(--nv); }
+.reset-btn:active { background: rgba(118,185,0,.14); }
+.reset-btn:disabled, .reset-btn.busy { opacity: .5; cursor: default; }
 
 /* ── WebRTC 3D stream ────────────────────────────────────────────────── */
 .stream-wrap {

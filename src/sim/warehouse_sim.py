@@ -194,6 +194,36 @@ class WarehouseSim:
         with self._lock:
             self._running = False
 
+    def reset(self) -> dict:
+        """Reset the warehouse to its spawn state — pallets back on the racks, forklifts
+        home, no hazards — so a fresh demo can run without restarting. Mirrors
+        IsaacNavBackend.reset for byte-for-byte parity above the backend."""
+        with self._lock:
+            for name, (x, y, yaw) in getattr(self, "_spawn_forklifts", {}).items():
+                fk = self.forklifts[name]
+                fk.x, fk.y, fk.yaw = x, y, yaw
+                fk.phase = "idle"
+                fk.lift_height = 0.0
+                fk.carrying = None
+                fk.route = []
+                fk.queue = []
+                fk.target = None
+                fk.goal_kind = None
+                fk.speed = 0.0
+                fk.object_detected = "None"
+                fk.object_distance = 0.0
+                fk.path_blocked = False
+                fk._timer = 0.0
+            for pid, (x, y, node) in getattr(self, "_spawn_pallets", {}).items():
+                p = self.pallets[pid]
+                p.x, p.y, p.node = x, y, node
+                p.carried_by = None
+                p.delivered = False
+            for z in self.zones.values():
+                z.blocked = False
+            self.hazards.clear()
+        return {"ok": True, "reset": True}
+
     # ---- geometry helpers ------------------------------------------------ #
     def _rack_nodes(self) -> set[str]:
         return {n for n in self.graph.nodes if n.startswith("rack")}
@@ -603,3 +633,7 @@ def build_demo_warehouse(sim: WarehouseSim) -> None:
         x, y = g.nodes[node]
         sim.forklifts[name] = Forklift(name, x, y, yaw=0.0)
         sim.home[name] = node
+
+    # Remember the spawn layout so the sim can be reset to a clean state between demos.
+    sim._spawn_forklifts = {n: (f.x, f.y, f.yaw) for n, f in sim.forklifts.items()}
+    sim._spawn_pallets = {pid: (p.x, p.y, p.node) for pid, p in sim.pallets.items()}

@@ -376,6 +376,28 @@ class IsaacNavBackend:
                 best, best_d = zid, d
         return best
 
+    def reset(self) -> dict:
+        """Reset the scene to its start state — pallets back on the racks, forklifts home
+        on their chargers, full battery, no hazards — WITHOUT restarting Isaac, so the live
+        WebRTC stream keeps running and the operator can run demo after demo. Only the
+        shared bus is reset here; the scene controller teleports the USD prims back on its
+        next physics step (it watches `bus.reset_epoch`)."""
+        for name, (x, y, yaw) in FORKLIFTS.items():
+            self.bus.clear_command(name)
+            self.bus.update_telemetry(
+                name, x=x, y=y, yaw=math.radians(yaw), phase="idle", speed=0.0,
+                lift_height=0.0, carrying=None, route=[], target=None, goal_kind=None,
+                object_detected="None", object_distance=0.0, path_blocked=False,
+                battery=100.0)
+        for pid, meta in PALLETS.items():
+            self.bus.set_pallet(pid, x=meta["xy"][0], y=meta["xy"][1],
+                                carried_by=None, delivered=False)
+        for zid, (zx, zy) in ZONES.items():
+            self.bus.set_zone(zid, x=zx, y=zy, blocked=False)
+        self.hazards.clear()
+        self.bus.request_reset()
+        return {"ok": True, "reset": True}
+
     # ---- snapshot ------------------------------------------------------- #
     def snapshot(self) -> dict:
         forklifts = {}
