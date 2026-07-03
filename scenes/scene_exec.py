@@ -80,6 +80,7 @@ CHARGERS = {                        # charging docks (each forklift's home = its
 }
 PALLET_TOP_Z = 0.14
 PAYLOAD_DROP = 0.06
+PALLET_FLOOR_Z = 0.0                 # pallet origin rests here on the floor / a bay pad
 
 # Cinematic overview camera — frames the whole floor (forklifts ±6, pallets ±3,
 # staging at y=7). Sits INSIDE the warehouse footprint (eye within the ±6 x-range so
@@ -109,11 +110,12 @@ TURN_RATE     = math.radians(140.0) # rad/s max yaw slew toward travel heading
 # sits idle at (near) its home charger it trickles back up. cuOpt reads the live % from
 # the snapshot and (a) won't route a truck past its remaining range and (b) prefers the
 # more-charged truck — see cuopt_planner. BATTERY_DRAIN_PER_M must match the planner's
-# BATTERY_RANGE_PER_PCT (range = battery / drain). Drain is deliberately steep so the
-# fleet's charge visibly matters — a partly-used truck can be out-ranged by a full one,
-# which is what makes cuOpt's battery-aware selection demonstrable.
+# BATTERY_RANGE_PER_PCT (range = battery / drain, i.e. 1/0.8). Drain is steep enough that
+# the fleet's charge visibly matters — a partly-used truck can be out-ranged by a full one
+# — yet a full truck can still finish the whole job on one charge, so cuOpt's battery-aware
+# selection is demonstrable without stranding a truck mid-tour.
 BATTERY_FULL         = 100.0
-BATTERY_DRAIN_PER_M  = 4.0          # % of charge spent per metre driven (steep, for demo)
+BATTERY_DRAIN_PER_M  = 1.25         # % of charge spent per metre driven (== 1 / 0.8 m/%)
 BATTERY_CHARGE_PER_S = 10.0         # % regained per second while idle on the charger
 BATTERY_CHARGE_RADIUS = 1.5         # m from home within which charging happens
 # The rigged model's visual forward (fork direction) is offset from the articulation
@@ -159,6 +161,9 @@ _BUS = bus()
 # WH_Palette_0N (bus id) <-> /World/Pallets/Pallet_0(N-1) (USD prim)
 _PALLET_PATH = {f"WH_Palette_{i + 1:02d}": f"/World/Pallets/Pallet_{i:02d}"
                 for i in range(len(PALLETS))}
+# Each pallet carries a cargo box (payload) that must ride along when the pallet moves.
+_PAYLOAD_PATH = {f"WH_Palette_{i + 1:02d}": f"/World/Payloads/Payload_{i:02d}"
+                 for i in range(len(PALLETS))}
 
 
 def _set_pose(stage, prim_path, xyz, yaw_deg=0.0, scale=1.0):
@@ -214,9 +219,9 @@ def _make_pallet_physics(stage, prim_path, forklift_paths):
     previously froze the whole fleet, so filtering the pair is what makes real pallet
     physics safe here. The pallet stays KINEMATIC while it rests on the rack and while it
     rides the forks (so it tracks the fork tip exactly, with no jitter or solver fighting
-    against the kinematically-driven base); on drop it is switched to a DYNAMIC body
-    (`_set_pallet_kinematic(..., False)`) so it settles onto the floor under gravity with
-    no clipping. Collision vs the ground plane and other pallets stays live throughout.
+    against the kinematically-driven base); on drop it stays KINEMATIC and is pinned flat
+    on the bay pad at floor height, so it sits exactly on the marker with no physics drift,
+    tilt, or collision against a pallet already staged there.
 
     CRITICAL: the SM_PaletteA collision ships as a *triangle mesh*, and PhysX cannot make
     a triangle-mesh body dynamic ("dynamic meshes (without SDF) are not supported"). We
@@ -771,7 +776,7 @@ def _init_controllers():
                 "lift_down": 0.0, "lift_up": LIFT_RAISE, "lift": 0.0,
                 # mission execution
                 "seq": -1, "legs": [], "leg_i": 0, "wp_i": 0,
-                "carrying": None, "carry_path": None,
+                "carrying": None, "carry_path": None, "payload_path": None,
                 "battery": BATTERY_FULL,
             }
             _log(f"[FleetMind] {name} articulation ready | dofs={len(names)} "
@@ -791,11 +796,15 @@ def _pull_command(name, c):
     the new destination — the pallet "rides home" instead of being staged. By deferring, the
     truck finishes delivering to staging first, then (now empty, at idle) picks up the newer
     mission on the next tick. The bus keeps returning the latest command, so nothing is lost.
+
+    EXCEPTION: a mission whose FIRST leg is a drop is a spill-reroute of the load we are
+    already carrying to a clear bay — adopt it immediately so the truck diverts instead of
+    driving into the now-blocked bay (the load still ends up staged, just elsewhere).
     """
     cmd = _BUS.get_command(name)
     if cmd.seq == c["seq"] or not cmd.legs:
         return
-    if c.get("carrying"):
+    if c.get("carrying") and cmd.legs[0].action != "drop":
         return                       # finish the drop first; adopt once empty
     c["seq"] = cmd.seq
     c["legs"] = cmd.legs
@@ -1066,6 +1075,7 @@ def _step_one(name, c, dt):
             if at_target and c["carrying"] is None:
                 c["carrying"] = leg.target
                 c["carry_path"] = leg.pallet_path or _PALLET_PATH.get(leg.target)
+                c["payload_path"] = _PAYLOAD_PATH.get(leg.target)
                 if c["carry_path"]:
                     # Make the load kinematic so it rides the fork tip exactly (also
                     # re-arms a pallet that was previously dropped as a dynamic body).
@@ -1087,15 +1097,21 @@ def _step_one(name, c, dt):
             _carry_follow(c, cx, cy, cyaw)
             if at_target and c["lift"] <= c["lift_down"] + 1e-3 and c["carrying"] is not None:
                 dx, dy = leg.drop_xy if leg.drop_xy else _fork_xy(cx, cy, cyaw)
+                # Stage the load ON the bay pad: fan each additional pallet dropped at the
+                # same bay into its own slot so a re-routed load sits beside the first
+                # rather than clipping into it.
+                dx, dy = _stage_slot(dx, dy)
                 if c["carry_path"]:
-                    # Position over the drop cell, then hand the pallet to gravity: it
-                    # switches from kinematic to a dynamic rigid body and settles onto the
-                    # floor under real physics (collision vs the ground stops the clip).
-                    _move_prim_xy(_RT["stage"], c["carry_path"], dx, dy, c["lift"])
-                    _set_pallet_kinematic(_RT["stage"], c["carry_path"], False)
+                    # Pin the pallet flat on the pad at floor height and keep it kinematic
+                    # so it sits exactly on the marker — no physics drift, tilt, or
+                    # inter-pallet collision: a clean, deliberate set-down.
+                    _move_prim_xy(_RT["stage"], c["carry_path"], dx, dy, PALLET_FLOOR_Z)
+                if c.get("payload_path"):
+                    _move_prim_xy(_RT["stage"], c["payload_path"], dx, dy,
+                                  PALLET_FLOOR_Z + PALLET_TOP_Z)
                 _BUS.set_pallet(c["carrying"], x=dx, y=dy, carried_by=None, delivered=True)
                 _log(f"[FleetMind] {name} DROPPED {c['carrying']} at ({dx:+.2f},{dy:+.2f})")
-                c["carrying"], c["carry_path"] = None, None
+                c["carrying"], c["carry_path"], c["payload_path"] = None, None, None
             if c["k"] >= ACT_STEPS and c["lift"] <= c["lift_down"] + 1e-3:
                 _advance_leg(c)
         else:  # goto / home — nothing to actuate
@@ -1129,10 +1145,27 @@ def _fork_xy(x, y, yaw):
     return x + math.cos(fwd) * FORK_REACH, y + math.sin(fwd) * FORK_REACH
 
 
+# Placement slots (metres, relative to a bay-pad centre) so several pallets staged at one
+# bay fan into a tidy cluster instead of landing on top of each other.
+_STAGE_SLOTS = [(0.0, 0.0), (0.62, 0.32), (-0.62, 0.32), (0.62, -0.32), (-0.62, -0.32)]
+
+
+def _stage_slot(x, y):
+    """Offset a drop point by how many pallets are already staged on that pad, so a
+    re-routed second load sits beside the first rather than clipping into it."""
+    n = sum(1 for p in _BUS.pallets.values()
+            if p.get("delivered") and math.hypot(p["x"] - x, p["y"] - y) < 1.5)
+    ox, oy = _STAGE_SLOTS[n % len(_STAGE_SLOTS)]
+    return x + ox, y + oy
+
+
 def _carry_follow(c, x, y, yaw):
     if c["carrying"] and c["carry_path"]:
         fx, fy = _fork_xy(x, y, yaw)
         _move_prim_xy(_RT["stage"], c["carry_path"], fx, fy, c["lift"])
+        if c.get("payload_path"):
+            # The cargo box rides on top of the pallet all the way to the bay.
+            _move_prim_xy(_RT["stage"], c["payload_path"], fx, fy, c["lift"] + PALLET_TOP_Z)
 
 
 def _active_route_pts(c, x, y):

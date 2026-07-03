@@ -109,7 +109,14 @@ def _narrate_offline(message: str, results: list[tuple[str, dict, str]]) -> str:
         elif name == "send_home":
             parts.append(f"{kwargs.get('robot')} returning home")
         elif name == "block_zone":
-            parts.append(f"blocked {kwargs.get('zone')}")
+            data = json.loads(out)
+            zone = (kwargs.get("zone") or "").replace("stage_", "Stage ")
+            kind = data.get("kind") or kwargs.get("kind") or "incident"
+            note = f"{kind} flagged in {zone} — bay closed"
+            rr = data.get("rerouted") or []
+            if rr:
+                note += f", {', '.join(rr)} re-routed to the nearest clear bay"
+            parts.append(note)
         elif name == "detect_conflict":
             conf = json.loads(results[0][2]).get("conflicts", [])
             parts.append("no conflicts detected" if not conf else "; ".join(conf))

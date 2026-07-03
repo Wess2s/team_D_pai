@@ -52,6 +52,12 @@ ZONES = {
     "stage_2": (0.0, 7.0),
     "stage_3": (6.0, 7.0),
 }
+# Charging docks — each forklift's home is its charger (mirrors scene_exec.CHARGERS), so
+# the ops-map can draw the same blue pads the 3D scene shows.
+CHARGERS = {
+    "charge_1": (-6.0, -3.0),
+    "charge_2": (6.0, 3.0),
+}
 
 # Densify every route into short, evenly-spaced waypoints so the truck tracks the
 # planned line tightly (instead of arcing between far-apart grid nodes) and gets a
@@ -71,6 +77,7 @@ class IsaacNavBackend:
 
     def __init__(self) -> None:
         self.bus = bus()
+        self.hazards: dict[str, dict] = {}   # zone id -> {kind,x,y,t,radius} incident
 
         # Register forklifts + pallets + zones on the shared bus.
         for name, (x, y, yaw) in FORKLIFTS.items():
@@ -286,11 +293,88 @@ class IsaacNavBackend:
         self.bus.send_mission(name, legs)
         return {"ok": True, "route": self._route_ids(legs[0].waypoints)}
 
-    def block_zone(self, zone_id: str) -> dict:
+    def block_zone(self, zone_id: str, kind: str = "spill") -> dict:
         if zone_id not in ZONES:
             return {"ok": False, "error": f"unknown zone {zone_id}"}
         self.bus.set_zone(zone_id, blocked=True)
-        return {"ok": True, "blocked": zone_id}
+        zx, zy = ZONES[zone_id]
+        self.hazards[zone_id] = {"zone": zone_id, "kind": kind, "x": zx, "y": zy,
+                                 "t": round(self.bus.elapsed(), 2), "radius": 1.6}
+        # Fleet reacts: any forklift with undelivered work bound for the now-blocked bay is
+        # re-planned so ONLY the leg(s) targeting that bay move to the nearest clear bay —
+        # its other pickups/drops (and any pallet already bound for a still-open bay) are
+        # preserved. This is the visible "spill -> reroute" moment; trucks with no work for
+        # the blocked bay are left untouched.
+        rerouted = []
+        for name in FORKLIFTS:
+            steps = self._reroute_steps(name, zone_id)
+            if steps is None:
+                continue
+            self.mission(name, steps)
+            rerouted.append(name)
+        return {"ok": True, "blocked": zone_id, "kind": kind, "rerouted": rerouted}
+
+    def _reroute_steps(self, name: str, blocked: str) -> list[list[str]] | None:
+        """Rebuild a forklift's REMAINING pick/drop tasks, diverting only the drops bound
+        for the blocked bay. Returns a steps list for mission(), or None if this truck has
+        no undelivered work for the blocked bay (so it should be left undisturbed).
+
+        Tasks are recovered from the live command legs (paired pick->drop) minus any pallet
+        already delivered. A pallet currently on the forks whose destination is still open is
+        left for the truck to finish via its current mission (the controller defers a fresh
+        mission while carrying) — we only re-issue it when its OWN bay is the blocked one, in
+        which case the redirect leads with a drop so the controller adopts it immediately.
+        """
+        cmd = self.bus.get_command(name)
+        t = self.bus.get_telemetry(name)
+        carrying = t.carrying
+
+        # Pair pick->drop across the full mission to recover (pallet, destination) tasks.
+        tasks: list[tuple[str, str]] = []
+        pending_pick: str | None = None
+        for leg in cmd.legs:
+            if leg.action == "pick":
+                pending_pick = leg.target
+            elif leg.action == "drop":
+                pallet = pending_pick or carrying
+                if pallet:
+                    tasks.append((pallet, leg.target))
+                pending_pick = None
+
+        remaining = [(p, z) for (p, z) in tasks
+                     if not self.bus.pallets.get(p, {}).get("delivered")]
+        heading_here = (t.target == blocked and t.goal_kind in ("drop", "goto"))
+        if not any(z == blocked for (_p, z) in remaining) and not heading_here:
+            return None
+
+        alt = self._nearest_free_zone(t.x, t.y, exclude=blocked)
+        if not alt:
+            return None
+
+        steps: list[list[str]] = []
+        for pallet, zone in remaining:
+            dest = alt if zone == blocked else zone
+            if pallet == carrying:
+                # Already on the forks. If its bay is still open the truck finishes it via
+                # the current mission (skip here); if its bay is blocked, lead with the drop
+                # so the controller redirects the load at once instead of entering the bay.
+                if zone == blocked:
+                    steps.append(["drop", dest])
+            else:
+                steps += [["pick", pallet], ["drop", dest]]
+        return steps or None
+
+    def _nearest_free_zone(self, x: float, y: float,
+                           exclude: str | None = None) -> str | None:
+        """Closest un-blocked staging bay to (x, y), or None if all are blocked."""
+        best, best_d = None, float("inf")
+        for zid, (zx, zy) in ZONES.items():
+            if zid == exclude or self.bus.zones.get(zid, {}).get("blocked"):
+                continue
+            d = math.hypot(zx - x, zy - y)
+            if d < best_d:
+                best, best_d = zid, d
+        return best
 
     # ---- snapshot ------------------------------------------------------- #
     def snapshot(self) -> dict:
@@ -310,13 +394,16 @@ class IsaacNavBackend:
         pallets = {pid: {"x": round(p["x"], 3), "y": round(p["y"], 3),
                          "carried_by": p.get("carried_by"), "delivered": bool(p.get("delivered"))}
                    for pid, p in self.bus.pallets.items()}
-        zones = {zid: {"x": z["x"], "y": z["y"], "blocked": bool(z.get("blocked"))}
+        zones = {zid: {"x": z["x"], "y": z["y"], "blocked": bool(z.get("blocked")),
+                       "hazard": self.hazards.get(zid, {}).get("kind")}
                  for zid, z in self.bus.zones.items()}
         return {
             "t": round(self.bus.elapsed(), 2),
             "forklifts": forklifts,
             "pallets": pallets,
             "zones": zones,
+            "chargers": {cid: {"x": x, "y": y} for cid, (x, y) in CHARGERS.items()},
+            "hazards": {zid: dict(h) for zid, h in self.hazards.items()},
             "graph": self.bus.graph,
         }
 

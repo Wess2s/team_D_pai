@@ -29,7 +29,7 @@ const EXAMPLES = [
   "Move pallet 1 to stage 1",
   "Clear all the pallets off the racks into staging",
   "Send all forklifts home",
-  "Spill in stage 2 — block it",
+  "Spillage in area 2",
 ];
 
 // ── state ────────────────────────────────────────────────────────────────
@@ -49,12 +49,20 @@ const prevPhase = {};
 let prevDelivered = new Set();
 let seededEvents = false;
 
+// hazard animation state (zone id -> ms timestamp first seen, for grow-in)
+const hazardBorn = {};
+
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const canvas = document.getElementById("map");
 const ctx = canvas.getContext("2d");
 const rosterEl = document.getElementById("roster");
 const chatLog = document.getElementById("chatLog");
 const activityLog = document.getElementById("activityLog");
+const hazardBanner = document.getElementById("hazardBanner");
+const hazardVignette = document.getElementById("hazardVignette");
+const hzIcon = document.getElementById("hzIcon");
+const hzText = document.getElementById("hzText");
+const hzSub = document.getElementById("hzSub");
 const rcards = {};           // name -> {el, refs...}
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -205,16 +213,90 @@ function draw(now) {
   if (!snap || !bounds) return;
   computeTransform(w, h);
 
+  drawStructures(snap);
   drawLanes(snap);
   drawRacks(snap);
   drawZones(snap);
+  drawChargers(snap);
   drawPallets(snap);
   drawPlanPaths(snap, now);
   drawRoutes(snap, now);
   drawTrails(snap);
   drawForklifts(snap, now);
   drawConflicts(snap, now);
+  drawHazards(snap, now);
 }
+
+// Warehouse shell — floor slab + perimeter walls + dock stripe, derived from the
+// drivable node extent so the ops-map reads like the 3D Simple_Warehouse room
+// instead of a bare dot-field.
+function drawStructures(s) {
+  const nodes = (s.graph && s.graph.nodes) || {};
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const xy of Object.values(nodes)) {
+    minX = Math.min(minX, xy[0]); maxX = Math.max(maxX, xy[0]);
+    minY = Math.min(minY, xy[1]); maxY = Math.max(maxY, xy[1]);
+  }
+  for (const z of Object.values(s.zones || {})) {
+    minX = Math.min(minX, z.x); maxX = Math.max(maxX, z.x);
+    minY = Math.min(minY, z.y); maxY = Math.max(maxY, z.y);
+  }
+  if (minX === Infinity) return;
+  const m = 1.6;                       // wall stand-off from the outermost waypoints
+  const x0 = sx(minX - m), x1 = sx(maxX + m);
+  const y0 = sy(maxY + m), y1 = sy(minY - m);   // y flipped
+  const w = x1 - x0, h = y1 - y0;
+
+  // floor slab
+  ctx.save();
+  roundRect(x0, y0, w, h, 12);
+  const fg = ctx.createLinearGradient(x0, y0, x0, y1);
+  fg.addColorStop(0, "rgba(20,28,40,.55)"); fg.addColorStop(1, "rgba(11,17,26,.55)");
+  ctx.fillStyle = fg; ctx.fill();
+  ctx.clip();
+  // faint floor grid
+  ctx.strokeStyle = "rgba(60,80,112,.10)"; ctx.lineWidth = 1;
+  const step = 2 * TF.s;               // ~2 m tiles
+  for (let gx = x0; gx <= x1; gx += step) { ctx.beginPath(); ctx.moveTo(gx, y0); ctx.lineTo(gx, y1); ctx.stroke(); }
+  for (let gy = y0; gy <= y1; gy += step) { ctx.beginPath(); ctx.moveTo(x0, gy); ctx.lineTo(x1, gy); ctx.stroke(); }
+  ctx.restore();
+
+  // perimeter wall
+  ctx.save();
+  roundRect(x0, y0, w, h, 12);
+  ctx.strokeStyle = "rgba(90,116,156,.55)"; ctx.lineWidth = 3.5; ctx.stroke();
+  ctx.strokeStyle = "rgba(140,168,210,.28)"; ctx.lineWidth = 1.2; ctx.stroke();
+  ctx.restore();
+
+  // dock stripe along the staging (+y / top) wall
+  const zy = sy(maxY + m) + 3;
+  ctx.save();
+  ctx.strokeStyle = "rgba(118,185,0,.22)"; ctx.lineWidth = 2; ctx.setLineDash([9, 7]);
+  ctx.beginPath(); ctx.moveTo(x0 + 10, zy); ctx.lineTo(x1 - 10, zy); ctx.stroke();
+  ctx.restore();
+  ctx.setLineDash([]);
+}
+
+// Charging docks — blue pads at each forklift home, mirroring the 3D scene's
+// charger markers so the map and the sim agree on where trucks recharge.
+function drawChargers(s) {
+  const u = TF.s;
+  for (const [id, c] of Object.entries(s.chargers || {})) {
+    const x = sx(c.x), y = sy(c.y), r = 0.8 * u;
+    ctx.save();
+    roundRect(x - r, y - r, r * 2, r * 2, 6);
+    const g = ctx.createLinearGradient(x, y - r, x, y + r);
+    g.addColorStop(0, hexA("#34d3ee", .22)); g.addColorStop(1, hexA("#3b82f6", .10));
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = hexA("#34d3ee", .7); ctx.lineWidth = 1.4; ctx.setLineDash([4, 3]);
+    ctx.stroke(); ctx.setLineDash([]);
+    // lightning glyph
+    ctx.fillStyle = hexA("#8fe9ff", .9);
+    ctx.font = `700 ${Math.max(10, 0.7 * u)}px 'JetBrains Mono', monospace`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("⚡", x, y + 0.5);
+    ctx.restore();
+  }}
 
 function drawLanes(s) {
   const nodes = s.graph.nodes;
@@ -297,6 +379,58 @@ function drawPallets(s) {
     ctx.textAlign = "center"; ctx.textBaseline = "bottom";
     ctx.fillText(id.replace("WH_Palette_", "P"), x, y - r - 4);
   }
+}
+
+// Incident visuals — animated spill/fire puddle, hazard-tape ring, pulsing danger
+// halo and warning glyph on any zone flagged by `spill in area N`.  This is the
+// on-map "wow factor": it grows, pulses and sweeps in real time.
+function drawHazards(s, now) {
+  const hz = s.hazards || {};
+  const t = now / 1000;
+  for (const [zid, h] of Object.entries(hz)) {
+    const z = (s.zones || {})[zid] || {};
+    const wx = (h.x != null ? h.x : z.x), wy = (h.y != null ? h.y : z.y);
+    if (wx == null) continue;
+    const x = sx(wx), y = sy(wy);
+    const fire = h.kind === "fire";
+    const base = fire ? "#ff7a1a" : "#ff4d5e";
+    const rad = (h.radius || 1.6) * TF.s;
+    // spawn-in grow: first ~1.2 s after appearing (tracked client-side)
+    const born = hazardBorn[zid] || (hazardBorn[zid] = now);
+    const spawn = Math.min(1, (now - born) / 1200);
+    const R = rad * (0.55 + 0.45 * spawn);
+
+    ctx.save();
+    // 1) puddle — soft radial pool
+    const pg = ctx.createRadialGradient(x, y, R * 0.15, x, y, R);
+    pg.addColorStop(0, hexA(base, .55));
+    pg.addColorStop(0.6, hexA(base, .28));
+    pg.addColorStop(1, hexA(base, 0));
+    ctx.fillStyle = pg;
+    ctx.beginPath(); ctx.ellipse(x, y, R, R * 0.82, 0, 0, 7); ctx.fill();
+
+    // 2) pulsing danger halo
+    const pulse = 0.5 + 0.5 * Math.sin(t * 4);
+    ctx.strokeStyle = hexA(base, .35 + .45 * pulse);
+    ctx.lineWidth = 2 + 1.5 * pulse;
+    ctx.beginPath(); ctx.ellipse(x, y, R * (1.02 + 0.12 * pulse), R * 0.82 * (1.02 + 0.12 * pulse), 0, 0, 7); ctx.stroke();
+
+    // 3) rotating hazard-tape ring (dashed, sweeping)
+    ctx.strokeStyle = fire ? hexA("#ffd24a", .8) : hexA("#ffcf3a", .8);
+    ctx.lineWidth = 3; ctx.setLineDash([10, 8]); ctx.lineDashOffset = -(now / 40) % 1000;
+    ctx.beginPath(); ctx.ellipse(x, y, R * 1.28, R * 1.02, 0, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 4) warning glyph
+    ctx.font = `700 ${Math.max(14, 1.1 * TF.s)}px 'JetBrains Mono', monospace`;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "#fff";
+    ctx.shadowColor = base; ctx.shadowBlur = 12;
+    ctx.fillText(fire ? "🔥" : "⚠", x, y - 0.5);
+    ctx.restore();
+  }
+  // forget hazards that cleared so a re-spill re-animates the grow-in
+  for (const k of Object.keys(hazardBorn)) if (!hz[k]) delete hazardBorn[k];
 }
 
 function drawRoutes(s, now) {
@@ -396,14 +530,22 @@ function renderPlanPanel() {
     return;
   }
   const cbs = plan.cbs || {};
+  const batt = plan.battery || {};
   const rows = Object.entries(plan.assignments).map(([fk, tasks]) => {
     const t = (tasks || []).map(s => s.replace("WH_Palette_", "P").replace("\u2192", " \u2192 ")).join(", ");
-    return `<div class="plan-row"><span class="plan-fk">${fk}</span><span class="plan-task">${t || "—"}</span></div>`;
+    const b = batt[fk];
+    const bcol = b == null ? NV : (b <= 15 ? RED : b <= 40 ? AMBER : NV);
+    const bcell = b == null ? "" : `<span class="plan-batt" style="color:${bcol}">${b}%</span>`;
+    return `<div class="plan-row"><span class="plan-fk">${fk}</span><span class="plan-task">${t || "—"}</span>${bcell}</div>`;
   }).join("");
+  const rc = plan.recharging || [];
+  const rcRow = rc.length
+    ? `<div class="plan-row plan-recharge"><span class="plan-fk">${rc.join(", ")}</span><span class="plan-task">↺ recharging (low battery)</span></div>`
+    : "";
   el.innerHTML =
     `<div class="plan-head">solver <b>${plan.solver}</b> · cost <b>${Math.round(plan.total_cost)}</b>` +
     ` · CBS <b>${cbs.conflicts_found || 0}</b> conflict(s) ${cbs.resolved ? "resolved" : "pending"}</div>` +
-    rows;
+    rows + rcRow;
 }
 
 function drawTrails(s) {
@@ -650,13 +792,49 @@ function detectEvents(s) {
     if (!prevDelivered.has(id))
       logEvent(NV, `<b>${id.replace("WH_Palette_", "Pallet ")}</b> delivered to staging ✓`);
   }
-  // zone blocks
+  // zone blocks / hazards (spill, fire, …) — richer than a plain block
+  const hz = s.hazards || {};
   for (const [zid, z] of Object.entries(s.zones || {})) {
     const key = "zone_" + zid;
-    if (z.blocked && !detectEvents[key]) { logEvent(RED, `<b>${zid.toUpperCase()}</b> blocked — incident flagged`); detectEvents[key] = true; }
+    if (z.blocked && !detectEvents[key]) {
+      const kind = (hz[zid] && hz[zid].kind) || z.hazard || "incident";
+      const label = kind.toUpperCase();
+      const zl = zid.toUpperCase().replace("STAGE_", "STAGE ");
+      logEvent(RED, `<b>⚠ ${label}</b> in ${zl} — bay closed, fleet re-routing`);
+      detectEvents[key] = true;
+    }
     if (!z.blocked) detectEvents[key] = false;
   }
+  updateHazardUI(s);
   prevDelivered = delivered;
+}
+
+// Drive the full-bleed incident banner + red screen vignette from live hazards.
+// Newest active hazard wins the banner; both clear the instant the bay reopens.
+function updateHazardUI(s) {
+  const hz = s.hazards || {};
+  const ids = Object.keys(hz);
+  const active = ids.length > 0;
+  if (hazardVignette) hazardVignette.classList.toggle("active", active);
+  if (!hazardBanner) return;
+  if (active) {
+    // pick the most-recent hazard by its sim timestamp
+    let top = ids[0];
+    for (const k of ids) if ((hz[k].t || 0) >= (hz[top].t || 0)) top = k;
+    const h = hz[top];
+    const fire = h.kind === "fire";
+    const zl = top.toUpperCase().replace("STAGE_", "STAGE ");
+    hazardBanner.classList.toggle("fire", fire);
+    if (hzIcon) hzIcon.textContent = fire ? "🔥" : "⚠";
+    if (hzText) hzText.textContent = `${(h.kind || "incident").toUpperCase()} — ${zl}`;
+    if (hzSub) hzSub.textContent = "Bay closed · fleet re-routing";
+    hazardBanner.hidden = false;
+    // next frame so the transition plays
+    requestAnimationFrame(() => hazardBanner.classList.add("show"));
+  } else {
+    hazardBanner.classList.remove("show");
+    hazardBanner.hidden = true;
+  }
 }
 
 function logEvent(col, html) {
@@ -722,7 +900,7 @@ function buildLegend() {
   const items = [
     ["Navigating", PHASE.navigating.c], ["Carrying", PHASE.carrying.c],
     ["Returning", PHASE.returning.c], ["Pallet", AMBER],
-    ["Staging", NV], ["Blocked", RED],
+    ["Staging", NV], ["Charger", "#34d3ee"], ["Hazard", RED],
   ];
   el.innerHTML = items.map(([l, c]) => `<span class="lg"><i style="background:${c}"></i>${l}</span>`).join("");
 }

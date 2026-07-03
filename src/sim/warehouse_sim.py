@@ -160,6 +160,7 @@ class WarehouseSim:
         self.pallets: dict[str, Pallet] = {}
         self.zones: dict[str, Zone] = {}
         self.home: dict[str, str] = {}   # forklift -> home node id
+        self.hazards: dict[str, dict] = {}   # zone id -> {kind,x,y,t,radius} incident
         self.t = 0.0
         build_demo_warehouse(self)
 
@@ -234,6 +235,13 @@ class WarehouseSim:
         """Start a single action immediately (internal; assumes lock held)."""
         if kind == "home":
             target = self.home.get(fk.name, self.graph.nearest(fk.x, fk.y))
+        # A staging bay under a hazard is closed: never route a drop/goto into it —
+        # divert to the nearest clear bay so a truck can't drive into the spill.
+        if (kind in ("drop", "goto") and target in self.zones
+                and self.zones[target].blocked):
+            alt = self._nearest_free_zone(fk.x, fk.y, exclude=target)
+            if alt:
+                target = alt
         dest = self._pos_of(target) if target else None
         if dest is None:
             return {"ok": False, "error": f"unknown target {target}"}
@@ -295,23 +303,51 @@ class WarehouseSim:
         kind, target = fk.queue.pop(0)
         return self._begin(fk, kind, target)
 
-    def block_zone(self, zone_id: str) -> dict:
+    def block_zone(self, zone_id: str, kind: str = "spill") -> dict:
         with self._lock:
-            if zone_id in self.zones:
-                self.zones[zone_id].blocked = True
-                return {"ok": True, "blocked": zone_id}
-            return {"ok": False, "error": f"unknown zone {zone_id}"}
+            if zone_id not in self.zones:
+                return {"ok": False, "error": f"unknown zone {zone_id}"}
+            z = self.zones[zone_id]
+            z.blocked = True
+            self.hazards[zone_id] = {"zone": zone_id, "kind": kind,
+                                     "x": z.x, "y": z.y, "t": round(self.t, 2),
+                                     "radius": 1.6}
+            # Fleet reacts: any forklift heading to the now-blocked bay is diverted to
+            # the nearest clear staging bay — whether it is already carrying or still en
+            # route to pick up (its queued drop is rewritten). This is the visible
+            # "spill → reroute" moment; trucks not heading there are untouched.
+            rerouted = []
+            for fk in self.forklifts.values():
+                diverted = False
+                # 1) rewrite any queued drop/goto step aimed at the blocked bay
+                for i, (k, t) in enumerate(fk.queue):
+                    if k in ("drop", "goto") and t == zone_id:
+                        alt = self._nearest_free_zone(fk.x, fk.y, exclude=zone_id)
+                        if alt:
+                            fk.queue[i] = (k, alt)
+                            diverted = True
+                # 2) if actively heading into the blocked bay right now, divert this leg
+                if fk.target == zone_id and fk.goal_kind in ("drop", "goto"):
+                    alt = self._nearest_free_zone(fk.x, fk.y, exclude=zone_id)
+                    if alt:
+                        self._begin(fk, fk.goal_kind, alt)
+                        diverted = True
+                if diverted:
+                    rerouted.append(fk.name)
+            return {"ok": True, "blocked": zone_id, "kind": kind,
+                    "rerouted": rerouted}
 
-    def move_pallet(self, pallet_id: str, x: float, y: float) -> dict:
-        """Operator dragged a pallet on the map: reposition it (if not carried)."""
-        with self._lock:
-            p = self.pallets.get(pallet_id)
-            if p is None:
-                return {"ok": False, "error": f"unknown pallet {pallet_id}"}
-            if getattr(p, "carried_by", None):
-                return {"ok": False, "error": f"{pallet_id} is being carried"}
-            p.x = float(x); p.y = float(y)
-            return {"ok": True}
+    def _nearest_free_zone(self, x: float, y: float,
+                           exclude: str | None = None) -> str | None:
+        """Closest un-blocked staging bay to (x, y), or None if all are blocked."""
+        best, best_d = None, float("inf")
+        for zid, z in self.zones.items():
+            if zid == exclude or z.blocked:
+                continue
+            d = math.hypot(z.x - x, z.y - y)
+            if d < best_d:
+                best, best_d = zid, d
+        return best
 
     # ---- simulation step ------------------------------------------------- #
     def step(self, dt: float) -> None:
@@ -460,8 +496,16 @@ class WarehouseSim:
                     for p in self.pallets.values()
                 },
                 "zones": {
-                    z.id: {"x": z.x, "y": z.y, "blocked": z.blocked}
+                    z.id: {"x": z.x, "y": z.y, "blocked": z.blocked,
+                           "hazard": self.hazards.get(z.id, {}).get("kind")}
                     for z in self.zones.values()
+                },
+                "hazards": {zid: dict(h) for zid, h in self.hazards.items()},
+                "chargers": {
+                    f"charge_{i + 1}": {"x": self.graph.nodes[node][0],
+                                        "y": self.graph.nodes[node][1]}
+                    for i, node in enumerate(self.home.values())
+                    if node in self.graph.nodes
                 },
                 "graph": {
                     "nodes": {n: list(xy) for n, xy in self.graph.nodes.items()},

@@ -84,9 +84,9 @@ def mission(robot: str, steps: list) -> dict:
     return _post("/mission", {"robot": robot, "steps": steps})
 
 
-def block_zone(zone: str) -> dict:
-    """Tell the sim a zone is blocked (e.g. an incident)."""
-    return _post("/block_zone", {"zone": zone})
+def block_zone(zone: str, kind: str = "spill") -> dict:
+    """Tell the sim a zone is blocked by an incident (spill/fire/hazard)."""
+    return _post("/block_zone", {"zone": zone, "kind": kind})
 
 
 if __name__ == "__main__":

@@ -31,10 +31,13 @@ except Exception:  # requests optional off-DGX
 # charge per metre, so its remaining travel range in metres is battery% * RANGE_PER_PCT.
 # cuOpt uses that as each vehicle's max route cost, and penalises low charge so the fuller
 # truck is preferred — i.e. it optimises travel cost AND preserves fleet battery. The
-# steep drain (0.25 m per 1%, == 4%/m in the sim) makes charge decisive: a partly-used
-# truck is genuinely out-ranged by a full one, so cuOpt swaps to the fuller truck and the
-# low one is sent to charge.
-BATTERY_RANGE_PER_PCT = 0.25    # metres of range per 1% charge (== 1 / 4%/m)
+# drain (0.8 m per 1%, == 1.25%/m in the sim) keeps charge visibly meaningful yet still
+# lets a FULL truck complete the whole job on one charge (100% -> 80 m range covers a lone
+# truck clearing every pallet, ~57 m, with headroom for roadmap detours), while a part-used
+# truck is genuinely out-ranged by a full one (40% -> 32 m can't take the big tour), so
+# cuOpt swaps to the fuller truck and the low one is sent to charge.
+BATTERY_RANGE_PER_PCT = 0.8     # metres of range per 1% charge (== 1 / 1.25
+BATTERY_RANGE_PER_PCT = 0.8     # metres of range per 1% charge (== 1 / 1.25%/m)
 BATTERY_PREF_WEIGHT   = 0.4     # fixed-cost penalty per 1% of missing charge
 LOW_BATTERY           = 40.0    # below this a truck is held back and sent to recharge
 
@@ -258,6 +261,11 @@ def _solve_cuopt(snap, rm, forklifts, tasks, all_pallets, all_zones) -> Plan:
     }
     data = _cuopt_solve(url, payload)
     routes = _parse_cuopt(data, fk_names, tasks, pickup_idx)
+    if not routes:
+        # cuOpt assigned no vehicle (e.g. reported the VRP infeasible). Never silently
+        # drop a mission when there are free forklifts and pending tasks — raise so the
+        # caller logs it and falls back to the local solver.
+        raise RuntimeError("cuOpt returned no vehicle assignments (infeasible)")
     total = _plan_cost(rm, snap, routes, all_pallets, all_zones)
     return Plan(routes, total, "cuopt")
 

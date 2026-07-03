@@ -15,8 +15,20 @@ import re
 from . import tools
 
 PALLET_RE = re.compile(r"(?:wh[_ ]?)?pal[a-z]*[ _]?(\d+)", re.I)
-ZONE_RE = re.compile(r"(?:stag(?:e|ing)|zone|bay)[_ ]?(\d+)", re.I)
+ZONE_RE = re.compile(r"(?:stag(?:e|ing)|zone|bay|area)[_ ]?(\d+)", re.I)
 FORKLIFT_RE = re.compile(r"(?:forklift|truck|amr|fork)[_ ]?(\d+)", re.I)
+
+
+def _hazard_kind(message: str) -> str:
+    """Classify the incident named in an operator message (default spill)."""
+    m = message.lower()
+    if "fire" in m or "smoke" in m or "flame" in m:
+        return "fire"
+    if "spill" in m or "leak" in m or "wet" in m:
+        return "spill"
+    if "block" in m or "close" in m:
+        return "blocked"
+    return "hazard"
 
 
 def _pallet(token_num: str) -> str:
@@ -59,8 +71,10 @@ def parse(message: str) -> list[tuple[str, dict]]:
         return [("plan_routes", {})]
 
     # --- incident / block ----------------------------------------------- #
-    if any(w in m for w in ("block", "incident", "spill", "hazard", "close ")) and zones:
-        return [("block_zone", {"zone": z}) for z in zones]
+    if any(w in m for w in ("block", "incident", "spill", "hazard", "fire", "leak",
+                            "close ", "emergency", "evacuate")) and zones:
+        kind = _hazard_kind(m)
+        return [("block_zone", {"zone": z, "kind": kind}) for z in zones]
 
     # --- send home / return --------------------------------------------- #
     if any(w in m for w in ("home", "charge", "charging", "park", "return", "dock")):

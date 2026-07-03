@@ -210,6 +210,8 @@ def _plan_and_dispatch(br, snap: dict, pallets: list[str] | None,
         "assignments": {fk: [f"{p}→{z}" for p, z in tasks]
                         for fk, tasks in routes.items()},
         "recharging": recharging,
+        "battery": {fk: round(f.get("battery", 100.0))
+                    for fk, f in snap.get("forklifts", {}).items()},
         "cbs": {"conflicts_found": cbs_res.conflicts_found,
                 "resolved": cbs_res.resolved,
                 "paths": cbs_res.paths},
@@ -250,12 +252,13 @@ def plan_routes() -> str:
 
 
 
-def block_zone(zone: str) -> str:
-    """Mark a staging zone blocked (e.g. an incident) so it is avoided."""
+def block_zone(zone: str, kind: str = "spill") -> str:
+    """Mark a staging zone blocked by an incident (spill/fire/hazard) so it is avoided,
+    and re-route any forklift heading there to the nearest clear bay."""
     br = _bridge()
     if br is None:
         return json.dumps({"ok": False, "error": "sim bridge unreachable"})
-    return json.dumps(br.block_zone(zone))
+    return json.dumps(br.block_zone(zone, kind))
 
 
 # --------------------------------------------------------------------------- #
@@ -322,9 +325,13 @@ TOOL_SCHEMAS = [
     }},
     {"type": "function", "function": {
         "name": "block_zone",
-        "description": "Mark a staging zone blocked due to an incident so it is avoided.",
+        "description": "Mark a staging zone blocked due to an incident (spill/fire/hazard) "
+                       "so it is avoided, and re-route any forklift heading there to the "
+                       "nearest clear bay. Use for 'spill in area 2', 'block stage 1'.",
         "parameters": {"type": "object", "properties": {
             "zone": {"type": "string"},
+            "kind": {"type": "string",
+                     "description": "incident type: spill | fire | hazard (default spill)"},
         }, "required": ["zone"]},
     }},
 ]
