@@ -837,6 +837,7 @@ def _publish(name, c, x, y, yaw, speed, target, route):
     # asset's articulation-root yaw is offset by MODEL_YAW_OFFSET (about -90°), so
     # convert back here before publishing telemetry.
     travel_yaw = _wrap(yaw + MODEL_YAW_OFFSET)
+    route = _active_route_node_ids(c, x, y)
     _BUS.update_telemetry(
         name, x=x, y=y, yaw=travel_yaw, speed=speed,
         phase=_phase_label(c), carrying=c["carrying"], lift_height=c["lift"],
@@ -1219,6 +1220,41 @@ def _active_route_pts(c, x, y):
     for nleg in c["legs"][c["leg_i"] + 1:]:
         pts.extend(nleg.waypoints)
     return pts
+
+
+def _active_route_node_ids(c, x, y):
+    """Convert the remaining world-space route into roadmap node ids for the 2D map.
+
+    The UI draws the forklift's current position as the first point, so we only publish
+    the not-yet-reached waypoints here. This keeps the live line focused on the mission's
+    full remaining path (e.g. forklift -> pallet -> stage) instead of just the current
+    leg target or a stale home leg."""
+    graph = _BUS.graph or {}
+    nodes = graph.get("nodes", {})
+    if not nodes:
+        return []
+    pts = _active_route_pts(c, x, y)
+    if len(pts) < 2:
+        return []
+
+    def nearest_node(px, py):
+        best = None
+        best_d = float("inf")
+        for nid, (nx, ny) in nodes.items():
+            d = math.hypot(float(nx) - px, float(ny) - py)
+            if d < best_d:
+                best = nid
+                best_d = d
+        return best
+
+    route = []
+    for px, py in pts[1:]:
+        nid = nearest_node(float(px), float(py))
+        if not nid:
+            continue
+        if not route or route[-1] != nid:
+            route.append(nid)
+    return route
 
 
 def _on_step(dt):
