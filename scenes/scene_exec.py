@@ -833,8 +833,12 @@ def _phase_label(c):
 
 def _publish(name, c, x, y, yaw, speed, target, route):
     _update_battery(c, x, y)
+    # UI/bridge yaw should represent forklift FORWARD/travel heading. The rigged
+    # asset's articulation-root yaw is offset by MODEL_YAW_OFFSET (about -90°), so
+    # convert back here before publishing telemetry.
+    travel_yaw = _wrap(yaw + MODEL_YAW_OFFSET)
     _BUS.update_telemetry(
-        name, x=x, y=y, yaw=yaw, speed=speed,
+        name, x=x, y=y, yaw=travel_yaw, speed=speed,
         phase=_phase_label(c), carrying=c["carrying"], lift_height=c["lift"],
         target=target, route=route, goal_kind=None,
         object_detected="None", object_distance=0.0,
