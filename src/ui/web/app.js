@@ -250,11 +250,11 @@ function draw(now) {
   drawRacks(snap);
   drawZones(snap);
   drawChargers(snap);
-  drawPallets(snap);
   drawPlanPaths(snap, now);
   drawRoutes(snap, now);
   drawTrails(snap);
   drawForklifts(snap, now);
+  drawPallets(snap);
   drawConflicts(snap, now);
   drawHazards(snap, now);
 }
@@ -392,9 +392,8 @@ function drawZones(s) {
 function drawPallets(s) {
   const u = TF.s;
   for (const [id, p] of Object.entries(s.pallets || {})) {
-    if (p.carried_by) continue;
     const x = sx(p.x), y = sy(p.y), r = 0.55 * u;
-    const col = p.delivered ? NV : AMBER;
+    const col = p.carried_by ? "#34d3ee" : (p.delivered ? NV : AMBER);
     // shadow
     roundRect(x - r + 2, y - r + 3, r * 2, r * 2, 4); ctx.fillStyle = "rgba(0,0,0,.35)"; ctx.fill();
     // body
@@ -409,7 +408,8 @@ function drawPallets(s) {
     ctx.fillStyle = col;
     ctx.font = "700 9px 'JetBrains Mono', monospace";
     ctx.textAlign = "center"; ctx.textBaseline = "bottom";
-    ctx.fillText(id.replace("WH_Palette_", "P"), x, y - r - 4);
+    const tag = id.replace("WH_Palette_", "P") + (p.carried_by ? "*" : "");
+    ctx.fillText(tag, x, y - r - 4);
   }
 }
 
@@ -617,7 +617,8 @@ function drawForklifts(s, now) {
       ctx.beginPath(); ctx.arc(x, y, 1.15 * u, 0, 7); ctx.stroke(); ctx.setLineDash([]);
     }
 
-    // directional wedge body
+    // directional wedge body; pallets are rendered separately so their true positions
+    // remain visible instead of being represented by a mini rectangle on the forks.
     const L = 0.95 * u, Wd = 0.72 * u;
     const c = Math.cos(yaw), si = Math.sin(yaw);
     const tip = [x + c * L, y + si * L];
@@ -631,14 +632,6 @@ function drawForklifts(s, now) {
     bg.addColorStop(0, hexA(col, .8)); bg.addColorStop(1, hexA(col, 1));
     ctx.fillStyle = bg; ctx.fill();
     ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 1.4; ctx.stroke();
-
-    // carried pallet on the forks
-    if (fk.carrying) {
-      const px = x + c * L * 1.15, py = y + si * L * 1.15, pr = 0.42 * u;
-      roundRect(px - pr, py - pr, pr * 2, pr * 2, 3);
-      ctx.fillStyle = NV; ctx.fill();
-      ctx.strokeStyle = "rgba(255,255,255,.8)"; ctx.lineWidth = 1; ctx.stroke();
-    }
 
     // name badge
     ctx.globalAlpha = 1;

@@ -4,8 +4,8 @@ streaming app via Kit's `--exec` hook (runheadless.sh owns the render loop).
 
 This is the production source of truth for the deployed scene. It:
 
-  build()          -> new stage, warehouse, physics + ground, 2 rigged forklifts,
-                      6 pallets + payloads, and 3 staging-zone floor markers.
+    build()          -> new stage, warehouse, physics + ground, 2 rigged forklifts,
+                                            3 pallets and 3 staging-zone floor markers.
   start_autonomy() -> play the timeline + register a physics-step callback that drives
                       each forklift along the waypoint route the fleet bus hands it,
                       performs pick / drop (raise/lower fork + carry the pallet prim),
@@ -78,8 +78,6 @@ CHARGERS = {                        # charging docks (each forklift's home = its
     "charge_1": (-6.0, -3.0),
     "charge_2": ( 6.0,  3.0),
 }
-PALLET_TOP_Z = 0.14
-PAYLOAD_DROP = 0.06
 PALLET_FLOOR_Z = 0.0                 # pallet origin rests here on the floor / a bay pad
 
 # Cinematic overview camera — frames the whole floor (forklifts ±6, pallets ±3,
@@ -95,6 +93,10 @@ PALLET_SUBPATH = "/Isaac/Environments/Simple_Warehouse/Props/SM_PaletteA_01.usd"
 SPAWN_Z = 0.03
 GROUND_STATIC_FRICTION  = 0.9
 GROUND_DYNAMIC_FRICTION = 0.8
+# TODO: Find a better way to make the pallet physics feel realistic. The current values are a hack to make the pallet not slide around too much when being carried.
+REALISTIC_PALLET_PHYSICS = True
+PALLET_STATIC_FRICTION  = 0.5
+PALLET_DYNAMIC_FRICTION = 0.4
 
 # ---- Kinematic path-following controller ----------------------------------
 # The forklift base is driven KINEMATICALLY: each physics step we set its world pose
@@ -103,9 +105,10 @@ GROUND_DYNAMIC_FRICTION = 0.8
 # the rear-wheel drive/steer physics, the runtime drive/steer sign calibration, the
 # stall watchdog and the reverse-recovery that made the truck drive the wrong way,
 # orbit the pallet, or ram it. The fork (lift_joint) is still actuated by its physics
-# drive, and a carried pallet is glued to the forks (see _carry_follow).
+# drive, and a carried pallet is tracked from its live physics pose (see _carry_follow).
 KIN_SPEED     = 1.6                 # m/s base travel speed along the route
 TURN_RATE     = math.radians(140.0) # rad/s max yaw slew toward travel heading
+CARRY_TURN_RATE = math.radians(25.0) # rad/s max yaw slew while carrying a live pallet
 # Battery model: each forklift starts full and drains with distance travelled; when it
 # sits idle at (near) its home charger it trickles back up. cuOpt reads the live % from
 # the snapshot and (a) won't route a truck past its remaining range and (b) prefers the
@@ -129,13 +132,38 @@ WAYPOINT_DIST = 0.6                 # m, advance to next waypoint within this
 ARRIVE_DIST   = 0.30                # m, intermediate leg goal reached
 PICK_ARRIVE   = 0.20                # m, tight final arrival for pick/drop
 PICK_SNAP     = 1.60                # m, max dist to leg end for the fork to (dis)engage
-# Forks reach this far ahead of the truck centre (travel/forward direction). It MUST
-# match the bridge's APPROACH_LEN standoff so that, at pick arrival, the fork tip sits
-# exactly over the pallet cell -> the load is engaged in place (no teleport onto the
-# truck) and lifts smoothly. A carried pallet is glued to this fork tip.
+PICK_INSERT_SPEED = 0.18            # m/s, very slow forward creep to insert forks
+PICK_INSERT_TOL   = 0.16            # m, fork-tip distance to pallet centre considered inserted
+PICK_INSERT_MAX   = 0.45            # m, safety cap on final insertion distance
+PICK_SLOW_DIST    = 2.0             # m, start slowing before the final pick waypoint
+PICK_SLOW_MIN     = 0.50            # speed scale at the final metres of pick approach
+DROP_BACKOFF_DIST = 1.2             # m, reverse after setting a pallet down to disengage forks
+DROP_BACKOFF_SPEED = 0.75           # m/s, slow reverse while backing out from a drop
+# Forks reach this far ahead of the truck centre (travel/forward direction). The bridge's
+# pick APPROACH_LEN is intentionally a bit larger than this reach, so normal-speed
+# navigation stops with the fork tip just SHORT of the pallet. Only the slow insertion
+# creep enters the pallet slots; otherwise the kinematic truck pushes the pallet.
 FORK_REACH    = 1.4
-LIFT_RAISE    = 0.35                # m visible fork travel (pallet clears the floor)
+LIFT_RAISE    = 0.42                # m visible fork travel (pallet clears the floor)
 LIFT_RATE     = 0.01                # m/step fork travel
+LIFT_DOWN_OFFSET = 0.07             # m above the joint lower limit for the fork's rest pose
+# Simplified-mode carried-load vertical anchoring: the lift joint command (`c["lift"]`)
+# is not the same as the visual tine world Z on this rig. Without an offset the pallet can
+# appear clipped below the forks while "carried". Realistic mode reads the live pallet pose.
+FORK_CARRY_Z_OFFSET = 0.16          # m above lift command where the pallet sits on forks
+PALLET_LIFTED_Z = 0.05              # m above floor: treat pallet as physically lifted
+CARRY_SPEED_SCALE = 0.65            # slower loaded travel so dynamic pallet contacts settle
+CARRY_ACCEL       = 0.55            # m/s^2 acceleration cap while carrying a live pallet
+LOADED_EXIT_MIN   = 0.55            # m, after pick back straight out before following route
+LOADED_EXIT_EXTRA = 0.25            # m beyond fork insertion, keeps first loaded move straight
+LOADED_EXIT_MAX   = 0.90            # m, cap straight reverse so we do not over-back into aisle
+LOADED_EXIT_SPEED = 0.35            # m/s, gentle reverse while pallet is newly lifted
+LOADED_EXIT_ACCEL = 0.18            # m/s^2, avoid instant slip impulse when backing out
+LOADED_WAYPOINT_DIST = 0.18         # m, do not skip small correction waypoints while loaded
+TURN_SLOW_FULL = math.radians(70.0) # yaw error at which turn-slowing reaches full effect
+TURN_SLOW_MIN = 0.45                # unloaded minimum speed scale during sharp turns
+CARRY_TURN_SLOW_MIN = 0.20          # loaded minimum speed scale during sharp turns
+PICK_LIFT_TIMEOUT_STEPS = 60        # don't wait forever for a noisy/missing lifted signal
 WARMUP_STEPS  = 5
 SETTLE_STEPS  = 60                  # let the base settle on the ground, capture rest Z
 ACT_STEPS     = 30                  # steps to hold during pick/drop lift
@@ -148,8 +176,7 @@ LOG_EVERY     = 120
 # side-steps (that pushed it INTO the other's path and clipped) — it simply waits.
 # Right-of-way is a strict total order so exactly one truck of any pair yields (no
 # deadlock): a LOADED truck outranks an empty one; ties break by name (AMR_1 first).
-YIELD_DIST    = 4.5                 # m, start slowing/stopping when the other is this close
-YIELD_STOP    = 3.0                 # m, fully stop and hold within this range
+YIELD_DIST    = 4.5                 # m, stop and hold when another moving truck blocks us
 YIELD_BEHIND  = -0.2               # cos threshold: ignore a truck clearly behind us
 # ===========================================================================
 
@@ -162,9 +189,6 @@ _BUS = bus()
 # WH_Palette_0N (bus id) <-> /World/Pallets/Pallet_0(N-1) (USD prim)
 _PALLET_PATH = {f"WH_Palette_{i + 1:02d}": f"/World/Pallets/Pallet_{i:02d}"
                 for i in range(len(PALLETS))}
-# Each pallet carries a cargo box (payload) that must ride along when the pallet moves.
-_PAYLOAD_PATH = {f"WH_Palette_{i + 1:02d}": f"/World/Payloads/Payload_{i:02d}"
-                 for i in range(len(PALLETS))}
 
 
 def _set_pose(stage, prim_path, xyz, yaw_deg=0.0, scale=1.0):
@@ -191,66 +215,96 @@ def _move_prim_xy(stage, prim_path, x, y, z):
     xform.AddTranslateOp().Set(Gf.Vec3d(float(x), float(y), float(z)))
 
 
-def _disable_physics(stage, prim_path):
-    """Strip collision + rigid-body physics from a prop subtree so it becomes a pure
-    visual we place kinematically. The warehouse SM_PaletteA pallet ships heavy
-    collision geometry; once a forklift's forks overlapped it, PhysX contact
-    generation exploded (aggregate-pair overflow) and the sim slowed to a crawl —
-    freezing the whole fleet. Our pick/carry/drop is entirely kinematic (we teleport
-    the pallet prim), so the pallets need no physics at all."""
-    root = stage.GetPrimAtPath(prim_path)
-    if not root or not root.IsValid():
-        return
-    for prim in Usd.PrimRange(root):
-        if prim.HasAPI(UsdPhysics.CollisionAPI):
-            a = prim.GetAttribute("physics:collisionEnabled")
-            if a:
-                a.Set(False)
-        if prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            a = prim.GetAttribute("physics:rigidBodyEnabled")
-            if a:
-                a.Set(False)
+def _configure_physics_material(mat_prim, static_friction, dynamic_friction):
+    """Author USD/PhysX material attrs with best-effort combine modes."""
+    pmat = UsdPhysics.MaterialAPI.Apply(mat_prim)
+    pmat.CreateStaticFrictionAttr(float(static_friction))
+    pmat.CreateDynamicFrictionAttr(float(dynamic_friction))
+    pmat.CreateRestitutionAttr(0.0)
+    try:
+        physx_mat_api = getattr(PhysxSchema, "PhysxMaterialAPI", None)
+        if physx_mat_api is None:
+            return
+        physx_mat = physx_mat_api.Apply(mat_prim)
+        max_token = getattr(getattr(PhysxSchema, "Tokens", object()), "max", "max")
+        min_token = getattr(getattr(PhysxSchema, "Tokens", object()), "min", "min")
+        for attr_name, value in (
+                ("CreateFrictionCombineModeAttr", max_token),
+                ("CreateRestitutionCombineModeAttr", min_token)):
+            create_attr = getattr(physx_mat, attr_name, None)
+            if create_attr is not None:
+                create_attr(value)
+    except Exception:
+        pass
 
 
 def _make_pallet_physics(stage, prim_path, forklift_paths):
-    """Give a pallet REAL rigid-body physics + collision, but filter its collision
-    against every forklift so the forks never generate contacts with it.
+    """Give a pallet rigid-body physics, collision, damping, and a physics material.
 
-    That fork/pallet contact explosion (PhysX aggregate-pair overflow) is exactly what
-    previously froze the whole fleet, so filtering the pair is what makes real pallet
-    physics safe here. The pallet stays KINEMATIC while it rests on the rack and while it
-    rides the forks (so it tracks the fork tip exactly, with no jitter or solver fighting
-    against the kinematically-driven base); on drop it stays KINEMATIC and is pinned flat
-    on the bay pad at floor height, so it sits exactly on the marker with no physics drift,
-    tilt, or collision against a pallet already staged there.
+    In realistic mode the pallet remains a dynamic rigid body so the fork lift/carry is
+    contact-driven. In simplified mode forklift/pallet contacts are filtered and the
+    carried pallet can be moved kinematically by the controller.
 
     CRITICAL: the SM_PaletteA collision ships as a *triangle mesh*, and PhysX cannot make
-    a triangle-mesh body dynamic ("dynamic meshes (without SDF) are not supported"). We
-    therefore force every collider to a CONVEX HULL approximation, which is a valid
-    dynamic collider — otherwise the kinematic→dynamic flip on drop is rejected and the
-    pallet clips straight through the floor."""
+    a triangle-mesh body dynamic unless it has an SDF collision representation. We
+    therefore force every realistic-mode collider to SDF (falling back to convex hull only
+    in simplified mode), so the dynamic pallet keeps a detailed collision shape instead
+    of a loose hull approximation."""
     prim = stage.GetPrimAtPath(prim_path)
     if not prim or not prim.IsValid():
         return
     rb = UsdPhysics.RigidBodyAPI.Apply(prim)
     rb.CreateRigidBodyEnabledAttr(True)
-    rb.CreateKinematicEnabledAttr(True)          # placed/carried kinematically until drop
+    rb.CreateKinematicEnabledAttr(not REALISTIC_PALLET_PHYSICS)
     mass = UsdPhysics.MassAPI.Apply(prim)
-    mass.CreateMassAttr(25.0)
+    mass.CreateMassAttr(55.0 if REALISTIC_PALLET_PHYSICS else 25.0)
+    try:
+        prb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+        prb.CreateEnableCCDAttr(True)
+        if REALISTIC_PALLET_PHYSICS:
+            prb.CreateLinearDampingAttr(1.2)
+            prb.CreateAngularDampingAttr(3.0)
+    except Exception:
+        pass
+    sdf_approx = getattr(UsdPhysics.Tokens, "sdf", "sdf")
     for p in Usd.PrimRange(prim):
         if p.HasAPI(UsdPhysics.CollisionAPI):
             a = p.GetAttribute("physics:collisionEnabled")
             if a:
                 a.Set(True)
-            # Convex hull so the body is a legal DYNAMIC collider (triangle meshes aren't).
             mc = UsdPhysics.MeshCollisionAPI.Apply(p)
-            mc.CreateApproximationAttr().Set(UsdPhysics.Tokens.convexHull)
-    # Filter pallet<->forklift contacts so the forks slide under the load without
-    # generating the contact storm that overflowed PhysX and stalled the sim.
-    fp = UsdPhysics.FilteredPairsAPI.Apply(prim)
-    rel = fp.CreateFilteredPairsRel()
-    for fpath in forklift_paths.values():
-        rel.AddTarget(Sdf.Path(fpath))
+            if REALISTIC_PALLET_PHYSICS:
+                mc.CreateApproximationAttr().Set(sdf_approx)
+                try:
+                    sdf_api = getattr(PhysxSchema, "PhysxSDFMeshCollisionAPI", None)
+                    if sdf_api is not None:
+                        sdf = sdf_api.Apply(p)
+                        create_resolution = getattr(sdf, "CreateSdfResolutionAttr", None)
+                        if create_resolution is not None:
+                            create_resolution(128)
+                        create_subgrid = getattr(sdf, "CreateSdfSubgridResolutionAttr", None)
+                        if create_subgrid is not None:
+                            create_subgrid(6)
+                except Exception:
+                    pass
+            else:
+                mc.CreateApproximationAttr().Set(UsdPhysics.Tokens.convexHull)
+    if not REALISTIC_PALLET_PHYSICS:
+        # Filter pallet<->forklift contacts only in the simplified carry mode.
+        fp = UsdPhysics.FilteredPairsAPI.Apply(prim)
+        rel = fp.CreateFilteredPairsRel()
+        for fpath in forklift_paths.values():
+            rel.AddTarget(Sdf.Path(fpath))
+    else:
+        mat_path = f"{prim_path}/PhysicsMaterial"
+        UsdShade.Material.Define(stage, mat_path)
+        mat_prim = stage.GetPrimAtPath(mat_path)
+        _configure_physics_material(mat_prim, PALLET_STATIC_FRICTION, PALLET_DYNAMIC_FRICTION)
+        UsdShade.MaterialBindingAPI.Apply(prim).Bind(
+            UsdShade.Material(mat_prim),
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            materialPurpose="physics",
+        )
 
 
 def _set_pallet_kinematic(stage, prim_path, kinematic):
@@ -265,6 +319,132 @@ def _set_pallet_kinematic(stage, prim_path, kinematic):
         UsdPhysics.RigidBodyAPI.Apply(prim).CreateKinematicEnabledAttr(bool(kinematic))
 
 
+def _set_rigid_body_velocities(stage, prim_path, linear=(0.0, 0.0, 0.0), angular=(0.0, 0.0, 0.0)):
+    """Reset a rigid body's linear / angular velocity so PhysX does not carry stale
+    motion across a teleport/reset."""
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return
+    try:
+        rb = UsdPhysics.RigidBodyAPI.Apply(prim)
+        rb.CreateVelocityAttr().Set(Gf.Vec3f(float(linear[0]), float(linear[1]), float(linear[2])))
+        rb.CreateAngularVelocityAttr().Set(
+            Gf.Vec3f(float(angular[0]), float(angular[1]), float(angular[2]))
+        )
+    except Exception:
+        for attr_name, value in (
+            ("physics:velocity", linear),
+            ("physics:angularVelocity", angular),
+            ("state:linear:physics:velocity", linear),
+            ("state:angular:physics:velocity", angular),
+        ):
+            try:
+                attr = prim.GetAttribute(attr_name)
+                if attr and attr.IsValid():
+                    attr.Set(Gf.Vec3f(float(value[0]), float(value[1]), float(value[2])))
+            except Exception:
+                pass
+
+
+def _set_rigid_body_enabled(stage, prim_path, enabled=True):
+    """Ensure a rigid body is enabled after a reset/carry/drop cycle."""
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return
+    try:
+        rb = UsdPhysics.RigidBodyAPI.Apply(prim)
+        rb.CreateRigidBodyEnabledAttr(bool(enabled))
+    except Exception:
+        try:
+            attr = prim.GetAttribute("physics:rigidBodyEnabled")
+            if attr and attr.IsValid():
+                attr.Set(bool(enabled))
+        except Exception:
+            pass
+
+
+def _set_collision_enabled(stage, prim_path, enabled=True):
+    """Restore collision flags on a pallet subtree after a reset."""
+    root = stage.GetPrimAtPath(prim_path)
+    if not root or not root.IsValid():
+        return
+    for prim in Usd.PrimRange(root):
+        if not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        try:
+            attr = prim.GetAttribute("physics:collisionEnabled")
+            if attr and attr.IsValid():
+                attr.Set(bool(enabled))
+        except Exception:
+            pass
+
+
+def _log_pallet_physics_state(stage, label):
+    """Log a compact pallet PhysX/collider summary for reset/collider debugging."""
+    bits = []
+    for i, _xy in enumerate(PALLETS):
+        pp = f"/World/Pallets/Pallet_{i:02d}"
+        prim = stage.GetPrimAtPath(pp)
+        if not prim or not prim.IsValid():
+            bits.append(f"P{i}:missing")
+            continue
+        rb = prim.GetAttribute("physics:rigidBodyEnabled")
+        kin = prim.GetAttribute("physics:kinematicEnabled")
+        enabled_colliders = 0
+        total_colliders = 0
+        for p in Usd.PrimRange(prim):
+            if not p.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            total_colliders += 1
+            attr = p.GetAttribute("physics:collisionEnabled")
+            if not attr or attr.Get() is not False:
+                enabled_colliders += 1
+        bits.append(
+            f"P{i}:rb={rb.Get() if rb else None},kin={kin.Get() if kin else None},"
+            f"coll={enabled_colliders}/{total_colliders}"
+        )
+    _log(f"[FleetMind] Pallet physics {label}: {'; '.join(bits)}")
+
+
+def _rearm_reset_pallet_physics(stage):
+    """After a reset teleport, release pallets back to dynamic mode with zeroed state.
+
+    Teleporting a live rigid body and immediately expecting stable carry behaviour left
+    stale solver velocity/contact state behind after a reset. Re-arming one beat later
+    gives PhysX a clean dynamic body again.
+    """
+    for i, _xy in enumerate(PALLETS):
+        pp = f"/World/Pallets/Pallet_{i:02d}"
+        _set_rigid_body_enabled(stage, pp, True)
+        _set_collision_enabled(stage, pp, True)
+        _set_rigid_body_velocities(stage, pp)
+        _set_pallet_kinematic(stage, pp, False)
+        _set_rigid_body_velocities(stage, pp)
+    _log_pallet_physics_state(stage, "re-armed")
+
+
+def _reset_forklift_articulation(c):
+    """Hard-reset a forklift articulation so no stale motion survives reset."""
+    art = c["art"]
+    hx, hy = c["home"]
+    hyaw = c["home_yaw"]
+    _set_base_pose(c, hx, hy, hyaw)
+    try:
+        art.set_joint_velocities(np.zeros(len(art.dof_names)))
+    except Exception:
+        pass
+    try:
+        positions = art.get_joint_positions()
+        if positions is not None and len(positions) >= 3:
+            positions = np.array(positions, dtype=float)
+            positions[c["idx"]["steer"]] = 0.0
+            positions[c["idx"]["lift"]] = c["lift_down"]
+            art.set_joint_positions(positions)
+    except Exception:
+        pass
+    _apply_cmd(art, c["idx"], 0.0, 0.0, c["lift_down"])
+
+
 def _bbox_size_x(stage, prim_path):
     cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
     rng = cache.ComputeWorldBound(stage.GetPrimAtPath(prim_path)).ComputeAlignedRange()
@@ -273,9 +453,13 @@ def _bbox_size_x(stage, prim_path):
     return float(rng.GetMax()[0] - rng.GetMin()[0])
 
 
-def _yaw_from_quat(q):
-    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+def _prim_world_xyz(stage, prim_path):
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return None
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    t = cache.GetLocalToWorldTransform(prim).ExtractTranslation()
+    return float(t[0]), float(t[1]), float(t[2])
 
 
 def _wrap(a):
@@ -312,6 +496,21 @@ def _configure_drives(stage, base_path):
         l.CreateDampingAttr(1.0e5)
         l.CreateTargetPositionAttr(0.0)
         l.CreateMaxForceAttr(1.0e7)
+
+
+def _joint_limit(prim, attr_name, fallback):
+    """Read a scalar joint limit attr from USD, falling back when missing/invalid."""
+    if not prim or not prim.IsValid():
+        return float(fallback)
+    try:
+        attr = prim.GetAttribute(attr_name)
+        if attr:
+            value = attr.Get()
+            if value is not None:
+                return float(value)
+    except Exception:
+        pass
+    return float(fallback)
 
 
 def _zone_marker(stage, zid, x, y):
@@ -590,11 +789,6 @@ def build():
     # cleaner to fork under than the tall plastic Props/Pallet). "a09" isn't a real
     # asset; PaletteA_01 is the closest warehouse pallet.
     pallet    = assets_root + PALLET_SUBPATH
-    payloads  = [
-        assets_root + "/Isaac/Props/YCB/Axis_Aligned/003_cracker_box.usd",
-        assets_root + "/Isaac/Props/YCB/Axis_Aligned/004_sugar_box.usd",
-        assets_root + "/Isaac/Props/KLT_Bin/small_KLT.usd",
-    ]
 
     ctx = omni.usd.get_context()
     ctx.new_stage()
@@ -648,6 +842,7 @@ def build():
     pal_x = _bbox_size_x(stage, "/World/_ppb")
     pallet_scale = 0.01 if pal_x > 50.0 else 1.0
     stage.RemovePrim("/World/_ppb")
+    _RT["pallet_scale"] = pallet_scale
     _log(f"[FleetMind] Pallet probe size_x={pal_x:.2f} -> scale={pallet_scale}")
 
     UsdGeom.Xform.Define(stage, "/World/AMRs")
@@ -663,17 +858,13 @@ def build():
         _make_follow_cam(stage, name)
 
     UsdGeom.Xform.Define(stage, "/World/Pallets")
-    UsdGeom.Xform.Define(stage, "/World/Payloads")
     for i, (x, y) in enumerate(PALLETS):
         pp = f"/World/Pallets/Pallet_{i:02d}"
         add_reference_to_stage(usd_path=pallet, prim_path=pp)
         _set_pose(stage, pp, (x, y, 0.0), 0.0, scale=pallet_scale)
         _make_pallet_physics(stage, pp, forklift_paths)
-        yp = f"/World/Payloads/Payload_{i:02d}"
-        add_reference_to_stage(usd_path=payloads[i % len(payloads)], prim_path=yp)
-        _set_pose(stage, yp, (x, y, PALLET_TOP_Z + PAYLOAD_DROP), 0.0)
-        _disable_physics(stage, yp)
         _BUS.set_pallet(f"WH_Palette_{i + 1:02d}", x=x, y=y, carried_by=None, delivered=False)
+    _log_pallet_physics_state(stage, "built")
 
     UsdGeom.Xform.Define(stage, "/World/Zones")
     for zid, (x, y) in ZONES.items():
@@ -749,16 +940,21 @@ def _init_controllers():
             art = SingleArticulation(prim_path=path, name=name)
             art.initialize()
             names = list(art.dof_names)
+            lift_joint_prim = _RT["stage"].GetPrimAtPath(f"{path}/lift_joint/lift_joint")
+            lift_lower_limit = _joint_limit(lift_joint_prim, "physics:lowerLimit", 0.0)
+            lift_up_limit = _joint_limit(lift_joint_prim, "physics:upperLimit", LIFT_RAISE)
+            lift_down = min(float(lift_up_limit), lift_lower_limit + LIFT_DOWN_OFFSET)
+            lift_up = max(lift_down, min(float(lift_up_limit), LIFT_RAISE))
             idx = {
                 "drive": names.index("back_wheel_drive"),
                 "steer": names.index("back_wheel_swivel"),
                 "lift":  names.index("lift_joint"),
             }
-            _apply_cmd(art, idx, 0.0, 0.0, 0.0)
+            _apply_cmd(art, idx, 0.0, 0.0, lift_down)
             pos0, quat0 = art.get_world_pose()
             hx, hy, hdeg = FORKLIFTS[name]
             ctrls[name] = {
-                "art": art, "idx": idx,
+                "art": art, "idx": idx, "name": name,
                 "phase": "settle", "k": 0,
                 # Kinematic base: pose is commanded directly along the route (no drive/
                 # steer physics, no sign calibration). We pin the truck to its intended
@@ -771,13 +967,20 @@ def _init_controllers():
                 # Reading back a floating-base articulation that we teleport each step
                 # let PhysX penetration shove the read-back position and it ran away to
                 # (-800,-1300) at 4.5 m/s. Commanded authority keeps logic/telemetry
-                # exact; set_world_pose + zero-velocity keeps the visual glued to it.
+                # exact; set_world_pose + zero-velocity keeps the visual locked to it.
                 "cx": float(hx), "cy": float(hy), "cyaw": math.radians(hdeg),
                 "last_xy": None,
-                "lift_down": 0.0, "lift_up": LIFT_RAISE, "lift": 0.0,
+                "lift_down": lift_down, "lift_up": lift_up, "lift": lift_down,
                 # mission execution
                 "seq": -1, "legs": [], "leg_i": 0, "wp_i": 0,
-                "carrying": None, "carry_path": None, "payload_path": None,
+                "carrying": None, "carry_path": None,
+                "drop_pending": None, "drop_pending_xy": None, "drop_pending_path": None,
+                "drop_backoff_m": 0.0,
+                "pick_engaged": None,
+                "pick_insert_m": 0.0,
+                "loaded_exit_m": 0.0,
+                "loaded_exit_goal": 0.0,
+                "speed_cmd": 0.0,
                 "battery": BATTERY_FULL,
             }
             _log(f"[FleetMind] {name} articulation ready | dofs={len(names)} "
@@ -805,12 +1008,19 @@ def _pull_command(name, c):
     cmd = _BUS.get_command(name)
     if cmd.seq == c["seq"] or not cmd.legs:
         return
+    if c.get("drop_pending"):
+        return
     if c.get("carrying") and cmd.legs[0].action != "drop":
         return                       # finish the drop first; adopt once empty
     c["seq"] = cmd.seq
     c["legs"] = cmd.legs
     c["leg_i"] = 0
     c["wp_i"] = 0
+    c["pick_engaged"] = None
+    c["pick_insert_m"] = 0.0
+    c["loaded_exit_m"] = 0.0
+    c["loaded_exit_goal"] = 0.0
+    c["speed_cmd"] = 0.0
     c["phase"] = "navigate"
     _log(f"[FleetMind] {name} mission seq={cmd.seq} legs="
          f"{[(l.action, l.target) for l in cmd.legs]}")
@@ -825,7 +1035,11 @@ def _phase_label(c):
         return "carrying" if c["carrying"] else "navigating"
     if c["phase"] == "act":
         leg = c["legs"][c["leg_i"]]
-        return "lifting" if leg.action in ("pick", "drop") else "navigating"
+        if leg.action == "pick":
+            return "lifting"
+        if leg.action == "drop":
+            return "dropping"
+        return "navigating"
     if c["phase"] == "return":
         return "returning"
     return "idle"
@@ -1011,6 +1225,7 @@ def _step_one(name, c, dt):
     # ---- idle: hold commanded pose, wait for a mission ------------------ #
     if c["phase"] == "idle":
         _set_base_pose(c, cx, cy, cyaw)
+        c["speed_cmd"] = 0.0
         _pull_command(name, c)
         _publish(name, c, cx, cy, cyaw, 0.0, None, [])
         c["last_xy"] = (cx, cy)
@@ -1024,8 +1239,35 @@ def _step_one(name, c, dt):
     if c["phase"] == "navigate":
         wps = leg.waypoints
         speed = 0.0
+        if (REALISTIC_PALLET_PHYSICS and c.get("carrying") and
+                c.get("loaded_exit_m", 0.0) < c.get("loaded_exit_goal", 0.0)):
+            fwd = cyaw + MODEL_YAW_OFFSET
+            remaining = c["loaded_exit_goal"] - c["loaded_exit_m"]
+            target_speed = min(
+                LOADED_EXIT_SPEED,
+                c.get("speed_cmd", 0.0) + LOADED_EXIT_ACCEL * dt,
+            )
+            step = min(target_speed * dt, remaining)
+            cx -= math.cos(fwd) * step
+            cy -= math.sin(fwd) * step
+            c["loaded_exit_m"] += step
+            c["cx"], c["cy"] = cx, cy
+            c["speed_cmd"] = step / max(dt, 1e-3)
+            speed = c["speed_cmd"]
+            _set_base_pose(c, cx, cy, cyaw)
+            if c["loaded_exit_m"] >= c["loaded_exit_goal"] - 1e-4:
+                c["speed_cmd"] = 0.0
+                _log(f"[FleetMind] {name} loaded straight-exit complete "
+                     f"({c['loaded_exit_m']:.2f} m)")
+            route = [leg.target] if leg.target else []
+            _publish(name, c, cx, cy, cyaw, speed, leg.target, route)
+            _carry_follow(c, cx, cy, cyaw)
+            c["last_xy"] = (cx, cy)
+            return cx, cy, cyaw
         if c["wp_i"] >= len(wps):
             _set_base_pose(c, cx, cy, cyaw)
+            c["speed_cmd"] = 0.0
+            c["pick_insert_m"] = 0.0
             c["phase"], c["k"] = "act", 0
             _log(f"[FleetMind] {name} arrived leg {c['leg_i']} '{leg.action}' "
                  f"target={leg.target} at ({cx:+.2f},{cy:+.2f}) -> act")
@@ -1038,6 +1280,7 @@ def _step_one(name, c, dt):
             # crossing/head-on is developing (route was planned static; trucks move live).
             handled, cx, cy, cyaw, yspeed = _yield_check(name, c, cx, cy, cyaw, travel, dt)
             if handled:
+                c["speed_cmd"] = 0.0
                 route = [leg.target] if leg.target else []
                 _publish(name, c, cx, cy, cyaw, yspeed, leg.target, route)
                 _carry_follow(c, cx, cy, cyaw)
@@ -1046,21 +1289,47 @@ def _step_one(name, c, dt):
             is_last = (c["wp_i"] == len(wps) - 1)
             if is_last:
                 reach = PICK_ARRIVE if leg.action in ("pick", "drop") else ARRIVE_DIST
+            elif REALISTIC_PALLET_PHYSICS and c["carrying"]:
+                reach = LOADED_WAYPOINT_DIST
             else:
                 reach = WAYPOINT_DIST
             if dist < reach:
                 c["wp_i"] += 1
+                if REALISTIC_PALLET_PHYSICS and c["carrying"]:
+                    c["speed_cmd"] = 0.0
             else:
                 # Step the commanded pose toward the waypoint at constant speed (clamped
                 # so we never overshoot) and slew heading toward travel so the forks
                 # lead. Deterministic: arrival is exact, no orbit/stall/ram/runaway.
-                step = min(KIN_SPEED * dt, dist)
+                target_yaw = _wrap(travel - MODEL_YAW_OFFSET)
+                turn_err = min(abs(_wrap(target_yaw - cyaw)), TURN_SLOW_FULL)
+                min_turn_scale = CARRY_TURN_SLOW_MIN if c["carrying"] else TURN_SLOW_MIN
+                turn_scale = 1.0 - (1.0 - min_turn_scale) * (turn_err / TURN_SLOW_FULL)
+
+                pick_scale = 1.0
+                if leg.action == "pick" and is_last:
+                    d = min(max(dist, 0.0), PICK_SLOW_DIST)
+                    pick_scale = PICK_SLOW_MIN + (1.0 - PICK_SLOW_MIN) * (d / PICK_SLOW_DIST)
+
+                target_speed = KIN_SPEED * turn_scale * pick_scale
+                if REALISTIC_PALLET_PHYSICS and c["carrying"]:
+                    target_speed *= CARRY_SPEED_SCALE
+                    prev_speed = c.get("speed_cmd", 0.0)
+                    target_speed = min(target_speed, prev_speed + CARRY_ACCEL * dt)
+                step = min(target_speed * dt, dist)
                 cx += step * math.cos(travel)
                 cy += step * math.sin(travel)
-                cyaw = _slew(cyaw, _wrap(travel - MODEL_YAW_OFFSET), TURN_RATE * dt)
+                turn_rate = CARRY_TURN_RATE if (REALISTIC_PALLET_PHYSICS and c["carrying"]) else TURN_RATE
+                cyaw = _slew(cyaw, target_yaw, turn_rate * dt)
                 c["cx"], c["cy"], c["cyaw"] = cx, cy, cyaw
                 _set_base_pose(c, cx, cy, cyaw)
                 speed = step / max(dt, 1e-3)
+                c["speed_cmd"] = speed
+            if leg.action == "pick":
+                # Keep the forks down on the inbound pick approach so the truck slides
+                # in under the pallet instead of approaching with raised forks.
+                c["lift"] = max(c["lift_down"], c["lift"] - LIFT_RATE)
+                _apply_cmd(art, idx, 0.0, 0.0, c["lift"])
         route = [leg.target] if leg.target else []
         _publish(name, c, cx, cy, cyaw, speed, leg.target, route)
         _carry_follow(c, cx, cy, cyaw)
@@ -1074,51 +1343,144 @@ def _step_one(name, c, dt):
         gx, gy = leg.waypoints[-1] if leg.waypoints else (cx, cy)
         at_target = math.hypot(gx - cx, gy - cy) <= PICK_SNAP
         if leg.action == "pick":
-            # The forks are already low and, at arrival, reaching UNDER the pallet
-            # (fork tip == pallet cell). Engage the load in place first, then raise
-            # the fork so _carry_follow lifts the pallet smoothly off the floor —
-            # no teleport onto the truck, no pre-raised "spawn on" pop.
-            if at_target and c["carrying"] is None:
-                c["carrying"] = leg.target
-                c["carry_path"] = leg.pallet_path or _PALLET_PATH.get(leg.target)
-                c["payload_path"] = _PAYLOAD_PATH.get(leg.target)
-                if c["carry_path"]:
-                    # Make the load kinematic so it rides the fork tip exactly (also
-                    # re-arms a pallet that was previously dropped as a dynamic body).
-                    _set_pallet_kinematic(_RT["stage"], c["carry_path"], True)
-                _BUS.set_pallet(leg.target, carried_by=name)
-                _log(f"[FleetMind] {name} ENGAGED {leg.target} (forks under load)")
-            if c["carrying"] is not None:
+            # Pick sequence: (1) force forks fully down, (2) creep forward so forks
+            # insert into the pallet, (3) engage, then (4) raise the forks.
+            if c["pick_engaged"] is None:
+                c["lift"] = max(c["lift_down"], c["lift"] - LIFT_RATE)
+                _apply_cmd(art, idx, 0.0, 0.0, c["lift"])
+
+            if at_target and c["carrying"] is None and c["pick_engaged"] is None:
+                p = _BUS.pallets.get(leg.target, {}) if leg.target else {}
+                px = p.get("x")
+                py = p.get("y")
+
+                inserted = False
+                fx, fy = _fork_xy(cx, cy, cyaw)
+                if px is not None and py is not None:
+                    inserted = (math.hypot(float(px) - fx, float(py) - fy) <= PICK_INSERT_TOL)
+
+                if not inserted and c["pick_insert_m"] < PICK_INSERT_MAX:
+                    fwd = cyaw + MODEL_YAW_OFFSET
+                    step = min(PICK_INSERT_SPEED * dt, PICK_INSERT_MAX - c["pick_insert_m"])
+                    cx += math.cos(fwd) * step
+                    cy += math.sin(fwd) * step
+                    c["pick_insert_m"] += step
+                    c["cx"], c["cy"] = cx, cy
+                    _set_base_pose(c, cx, cy, cyaw)
+                    fx, fy = _fork_xy(cx, cy, cyaw)
+                    if px is not None and py is not None:
+                        inserted = (math.hypot(float(px) - fx, float(py) - fy) <= PICK_INSERT_TOL)
+
+                # If pallet coords are unavailable, still complete the sequence after
+                # a bounded insertion creep so the truck does not stall indefinitely.
+                if (px is None or py is None) and c["pick_insert_m"] >= (0.5 * PICK_INSERT_MAX):
+                    inserted = True
+                elif c["pick_insert_m"] >= PICK_INSERT_MAX:
+                    inserted = True
+                    gap = math.hypot(float(px) - fx, float(py) - fy) if px is not None and py is not None else float("nan")
+                    _log(f"[FleetMind] {name} forcing pick engagement for {leg.target} "
+                         f"after max insertion (fork_gap={gap:.2f} m)")
+
+                if inserted:
+                    c["carry_path"] = leg.pallet_path or _PALLET_PATH.get(leg.target)
+                    c["pick_engaged"] = leg.target
+                    if c["carry_path"] and not REALISTIC_PALLET_PHYSICS:
+                        _set_pallet_kinematic(_RT["stage"], c["carry_path"], True)
+                    _log(f"[FleetMind] {name} ENGAGED {leg.target} (fork inserted)")
+            if c["pick_engaged"] is not None:
                 c["lift"] = min(c["lift_up"], c["lift"] + LIFT_RATE)
             _apply_cmd(art, idx, 0.0, 0.0, c["lift"])
             _carry_follow(c, cx, cy, cyaw)
-            if c["k"] >= ACT_STEPS and c["lift"] >= c["lift_up"] - 1e-3:
+            if REALISTIC_PALLET_PHYSICS and c["pick_engaged"] and c["carry_path"]:
+                pose = _prim_world_xyz(_RT["stage"], c["carry_path"])
+                lift_complete = c["lift"] >= c["lift_up"] - 1e-3
+                lift_timed_out = lift_complete and c["k"] >= PICK_LIFT_TIMEOUT_STEPS
+                if pose and pose[2] >= PALLET_LIFTED_Z:
+                    c["carrying"] = c["pick_engaged"]
+                    _BUS.set_pallet(c["carrying"], carried_by=name)
+                elif lift_timed_out:
+                    c["carrying"] = c["pick_engaged"]
+                    _BUS.set_pallet(c["carrying"], carried_by=name)
+                    z = pose[2] if pose else float("nan")
+                    _log(f"[FleetMind] {name} continuing after lift timeout for "
+                         f"{c['carrying']} (pallet_z={z:.3f}, lift={c['lift']:.3f})")
+            elif (not REALISTIC_PALLET_PHYSICS) and c["pick_engaged"]:
+                c["carrying"] = c["pick_engaged"]
+                _BUS.set_pallet(c["carrying"], carried_by=name)
+
+            can_advance = (c["carrying"] is not None) or (not REALISTIC_PALLET_PHYSICS)
+            if c["k"] >= ACT_STEPS and can_advance and c["lift"] >= c["lift_up"] - 1e-3:
+                if REALISTIC_PALLET_PHYSICS and c["carrying"]:
+                    c["loaded_exit_m"] = 0.0
+                    c["loaded_exit_goal"] = min(
+                        LOADED_EXIT_MAX,
+                        max(LOADED_EXIT_MIN, c.get("pick_insert_m", 0.0) + LOADED_EXIT_EXTRA),
+                    )
+                    c["speed_cmd"] = 0.0
+                    _log(f"[FleetMind] {name} loaded straight-exit armed "
+                         f"({c['loaded_exit_goal']:.2f} m) before route following")
+                c["pick_engaged"] = None
                 _advance_leg(c)
         elif leg.action == "drop":
             # Lower the fork first so the carried pallet descends with it, then release
-            # it onto the staging cell (delivered) — a smooth set-down, not a snap.
-            if at_target and c["carrying"] is not None:
+            # it onto the staging cell, reverse to disengage the forks, then mark it
+            # delivered — a smooth set-down rather than a snap-and-teleport.
+            drop_done = False
+            if c.get("drop_pending") is not None:
+                if c["drop_backoff_m"] < DROP_BACKOFF_DIST:
+                    fwd = cyaw + MODEL_YAW_OFFSET
+                    step = min(DROP_BACKOFF_SPEED * dt, DROP_BACKOFF_DIST - c["drop_backoff_m"])
+                    cx -= math.cos(fwd) * step
+                    cy -= math.sin(fwd) * step
+                    c["drop_backoff_m"] += step
+                    c["cx"], c["cy"] = cx, cy
+                    _set_base_pose(c, cx, cy, cyaw)
+                else:
+                    dx, dy = c["drop_pending_xy"] if c.get("drop_pending_xy") else (cx, cy)
+                    if REALISTIC_PALLET_PHYSICS and c.get("drop_pending_path"):
+                        pose = _prim_world_xyz(_RT["stage"], c["drop_pending_path"])
+                        if pose:
+                            dx, dy = pose[0], pose[1]
+                    _BUS.set_pallet(c["drop_pending"], x=dx, y=dy,
+                                    carried_by=None, delivered=True)
+                    _log(f"[FleetMind] {name} DROPPED {c['drop_pending']} at ({dx:+.2f},{dy:+.2f})")
+                    c["drop_pending"] = None
+                    c["drop_pending_xy"] = None
+                    c["drop_pending_path"] = None
+                    c["drop_backoff_m"] = 0.0
+                    drop_done = True
+            elif at_target and c["carrying"] is not None:
                 c["lift"] = max(c["lift_down"], c["lift"] - LIFT_RATE)
             _apply_cmd(art, idx, 0.0, 0.0, c["lift"])
             _carry_follow(c, cx, cy, cyaw)
-            if at_target and c["lift"] <= c["lift_down"] + 1e-3 and c["carrying"] is not None:
-                dx, dy = leg.drop_xy if leg.drop_xy else _fork_xy(cx, cy, cyaw)
-                # Stage the load ON the bay pad: fan each additional pallet dropped at the
-                # same bay into its own slot so a re-routed load sits beside the first
-                # rather than clipping into it.
-                dx, dy = _stage_slot(dx, dy)
-                if c["carry_path"]:
-                    # Pin the pallet flat on the pad at floor height and keep it kinematic
-                    # so it sits exactly on the marker — no physics drift, tilt, or
-                    # inter-pallet collision: a clean, deliberate set-down.
-                    _move_prim_xy(_RT["stage"], c["carry_path"], dx, dy, PALLET_FLOOR_Z)
-                if c.get("payload_path"):
-                    _move_prim_xy(_RT["stage"], c["payload_path"], dx, dy,
-                                  PALLET_FLOOR_Z + PALLET_TOP_Z)
-                _BUS.set_pallet(c["carrying"], x=dx, y=dy, carried_by=None, delivered=True)
-                _log(f"[FleetMind] {name} DROPPED {c['carrying']} at ({dx:+.2f},{dy:+.2f})")
-                c["carrying"], c["carry_path"], c["payload_path"] = None, None, None
-            if c["k"] >= ACT_STEPS and c["lift"] <= c["lift_down"] + 1e-3:
+            if (c.get("drop_pending") is None and at_target and
+                    c["lift"] <= c["lift_down"] + 1e-3 and c["carrying"] is not None):
+                if REALISTIC_PALLET_PHYSICS and c["carry_path"]:
+                    pose = _prim_world_xyz(_RT["stage"], c["carry_path"])
+                    if pose:
+                        dx, dy = pose[0], pose[1]
+                    else:
+                        dx, dy = _fork_xy(cx, cy, cyaw)
+                    c["drop_pending"] = c["carrying"]
+                    c["drop_pending_xy"] = (dx, dy)
+                    c["drop_pending_path"] = c["carry_path"]
+                    c["drop_backoff_m"] = 0.0
+                    _BUS.set_pallet(c["carrying"], x=dx, y=dy, carried_by=None,
+                                    delivered=False)
+                    c["carrying"], c["carry_path"] = None, None
+                    c["pick_engaged"] = None
+                else:
+                    dx, dy = leg.drop_xy if leg.drop_xy else _fork_xy(cx, cy, cyaw)
+                    dx, dy = _stage_slot(dx, dy)
+                    if c["carry_path"]:
+                        _move_prim_xy(_RT["stage"], c["carry_path"], dx, dy, PALLET_FLOOR_Z)
+                    c["drop_pending"] = c["carrying"]
+                    c["drop_pending_xy"] = (dx, dy)
+                    c["drop_pending_path"] = c["carry_path"]
+                    c["drop_backoff_m"] = 0.0
+                    _BUS.set_pallet(c["carrying"], x=dx, y=dy, carried_by=None, delivered=False)
+                    c["carrying"], c["carry_path"] = None, None
+            if c["k"] >= ACT_STEPS and c["lift"] <= c["lift_down"] + 1e-3 and drop_done:
                 _advance_leg(c)
         else:  # goto / home — nothing to actuate
             _advance_leg(c)
@@ -1135,11 +1497,20 @@ def _step_one(name, c, dt):
 def _advance_leg(c):
     c["leg_i"] += 1
     c["wp_i"] = 0
+    c["drop_pending"] = None
+    c["drop_pending_xy"] = None
+    c["drop_pending_path"] = None
+    c["drop_backoff_m"] = 0.0
+    c["pick_engaged"] = None
+    c["pick_insert_m"] = 0.0
     c["k"] = 0
     if c["leg_i"] >= len(c["legs"]):
         c["phase"] = "idle"
         c["legs"] = []
         c["leg_i"] = 0
+        c["loaded_exit_m"] = 0.0
+        c["loaded_exit_goal"] = 0.0
+        c["speed_cmd"] = 0.0
     else:
         c["phase"] = "navigate"
 
@@ -1166,36 +1537,57 @@ def _stage_slot(x, y):
 
 
 def _carry_follow(c, x, y, yaw):
-    if c["carrying"] and c["carry_path"]:
+    if not c.get("carry_path"):
+        return
+    if REALISTIC_PALLET_PHYSICS:
+        pose = _prim_world_xyz(_RT["stage"], c["carry_path"])
+        if pose and (c.get("carrying") or c.get("pick_engaged")):
+            _BUS.set_pallet(c.get("carrying") or c.get("pick_engaged"),
+                            x=pose[0], y=pose[1],
+                            carried_by=c.get("name") if c.get("carrying") else None)
+        return
+    if c["carrying"] or c.get("pick_engaged"):
         fx, fy = _fork_xy(x, y, yaw)
-        _move_prim_xy(_RT["stage"], c["carry_path"], fx, fy, c["lift"])
-        if c.get("payload_path"):
-            # The cargo box rides on top of the pallet all the way to the bay.
-            _move_prim_xy(_RT["stage"], c["payload_path"], fx, fy, c["lift"] + PALLET_TOP_Z)
+        pz = c["lift"] + FORK_CARRY_Z_OFFSET
+        _move_prim_xy(_RT["stage"], c["carry_path"], fx, fy, pz)
 
 
 def _apply_reset():
-    """Controller half of a between-demo reset: teleport every pallet + its cargo box back
-    to its rack cell and return each forklift to its home charger with a full battery. The
-    bridge has already reset the shared bus; this restores the USD prims so the 3D scene
-    visibly returns to its start state with no Isaac relaunch (the live stream stays up)."""
+    """Controller half of a between-demo reset: teleport every pallet back to its rack
+    cell and return each forklift to its home charger with a full battery. The bridge has
+    already reset the shared bus; this restores the USD prims so the 3D scene visibly
+    returns to its start state with no Isaac relaunch (the live stream stays up)."""
     stage = _RT["stage"]
     for i, (x, y) in enumerate(PALLETS):
         pp = f"/World/Pallets/Pallet_{i:02d}"
-        _set_pallet_kinematic(stage, pp, True)      # re-arm as kinematic (safe if already)
-        _move_prim_xy(stage, pp, x, y, PALLET_FLOOR_Z)
-        yp = f"/World/Payloads/Payload_{i:02d}"
-        _move_prim_xy(stage, yp, x, y, PALLET_TOP_Z + PAYLOAD_DROP)
+        _set_rigid_body_enabled(stage, pp, True)
+        _set_collision_enabled(stage, pp, True)
+        _set_pallet_kinematic(stage, pp, True)
+        _set_rigid_body_velocities(stage, pp)
+        _set_pose(stage, pp, (x, y, PALLET_FLOOR_Z), 0.0,
+                  scale=_RT.get("pallet_scale", 1.0))
+        _set_rigid_body_velocities(stage, pp)
+    _RT["pallet_reset_rearm_steps"] = 3 if REALISTIC_PALLET_PHYSICS else 0
+    _RT["reset_hold_steps"] = 4
+    _log_pallet_physics_state(stage, "reset-staged")
     for name, c in _RT.get("ctrls", {}).items():
         hx, hy = c["home"]
         hyaw = c["home_yaw"]
         c["phase"] = "idle"
         c["cx"], c["cy"], c["cyaw"] = hx, hy, hyaw
         c["last_xy"] = None
-        c["lift"] = 0.0
+        c["lift"] = c["lift_down"]
         c["carrying"] = None
         c["carry_path"] = None
-        c["payload_path"] = None
+        c["drop_pending"] = None
+        c["drop_pending_xy"] = None
+        c["drop_pending_path"] = None
+        c["drop_backoff_m"] = 0.0
+        c["pick_engaged"] = None
+        c["pick_insert_m"] = 0.0
+        c["loaded_exit_m"] = 0.0
+        c["loaded_exit_goal"] = 0.0
+        c["speed_cmd"] = 0.0
         c["legs"] = []
         c["leg_i"] = 0
         c["wp_i"] = 0
@@ -1203,7 +1595,7 @@ def _apply_reset():
         c["battery"] = BATTERY_FULL
         # Sync our command cursor so the just-cleared bus mission is not re-adopted.
         c["seq"] = _BUS.get_command(name).seq
-        _set_base_pose(c, hx, hy, hyaw)
+        _reset_forklift_articulation(c)
         _publish(name, c, hx, hy, hyaw, 0.0, None, [])
         _update_route_overlay(stage, name, [])
     _log("[FleetMind] Scene reset: pallets restocked, forklifts home, batteries full.")
@@ -1270,6 +1662,20 @@ def _on_step(dt):
     if _RT.get("reset_epoch", 0) != ep:
         _RT["reset_epoch"] = ep
         _apply_reset()
+        return
+    if REALISTIC_PALLET_PHYSICS and _RT.get("pallet_reset_rearm_steps", 0) > 0:
+        _RT["pallet_reset_rearm_steps"] -= 1
+        if _RT["pallet_reset_rearm_steps"] == 0:
+            _rearm_reset_pallet_physics(_RT["stage"])
+    if _RT.get("reset_hold_steps", 0) > 0:
+        _RT["reset_hold_steps"] -= 1
+        for name, c in _RT["ctrls"].items():
+            hx, hy = c["home"]
+            hyaw = c["home_yaw"]
+            _reset_forklift_articulation(c)
+            _publish(name, c, hx, hy, hyaw, 0.0, None, [])
+            _update_follow_cam(_RT["stage"], name, hx, hy, hyaw)
+            _update_route_overlay(_RT["stage"], name, [])
         return
     if not _RT.get("wp_drawn"):
         # Bridge publishes the graph after build(); draw the node dots once it's up.

@@ -66,10 +66,14 @@ CHARGERS = {
 # final leg is already square-on — no forced aisle detour needed. STEP matches the
 # controller's WAYPOINT_DIST so it advances smoothly point-to-point.
 ROUTE_STEP = 0.6                         # m between densified waypoints
-# Standoff for pick/drop: the forklift halts this far in front of the pallet/zone so its
-# body doesn't ram the load; the fork reaches under from here. ~1.4 m ≈ half a truck +
-# the forks, tuned to clear the pallet/rack collision that wedged the truck ~1.3 m out.
-APPROACH_LEN = 1.4
+# Standoff for pick/drop: stop slightly OUTSIDE fork reach so normal-speed navigation
+# does not drive the tines into the pallet. The scene controller then performs the last
+# few centimetres as a slow insertion creep, which avoids pushing the pallet sideways.
+APPROACH_LEN = 1.75
+# Pickups must enter through the pallet's wider fork slots, which run north/south in the
+# map. Route to a point several metres above/below the pallet first, then drive a straight
+# vertical runway into the standoff point so the truck is square before the fork inserts.
+PICK_RUNUP_LEN = 3.0
 
 
 class IsaacNavBackend:
@@ -201,6 +205,37 @@ class IsaacNavBackend:
             out.append((lx + (tx - lx) * f, ly + (ty - ly) * f))
         return out
 
+    @staticmethod
+    def _path_len(wpts: list[tuple[float, float]]) -> float:
+        return sum(math.hypot(bx - ax, by - ay)
+                   for (ax, ay), (bx, by) in zip(wpts, wpts[1:]))
+
+    def _pick_runup_candidates(self, goal_xy: tuple[float, float],
+                               approach: float = APPROACH_LEN,
+                               runup: float = PICK_RUNUP_LEN
+                               ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        """Upper/lower map-side pick approaches as (runway_start, final_standoff)."""
+        gx, gy = goal_xy
+        return [
+            ((gx, gy - approach - runup), (gx, gy - approach)),
+            ((gx, gy + approach + runup), (gx, gy + approach)),
+        ]
+
+    def _route_pick(self, start_xy: tuple[float, float],
+                    goal_xy: tuple[float, float],
+                    avoid: set[str] | None = None) -> list[tuple[float, float]]:
+        """Route to an upper/lower run-up, then drive straight into the pallet standoff.
+
+        This makes pickup orthogonal to the pallet and gives the truck a few metres of
+        aligned travel before the controller's slow fork-insertion creep begins."""
+        options = []
+        for runway_start, approach_xy in self._pick_runup_candidates(goal_xy):
+            route_to_runway = self._route_xy(start_xy, runway_start, avoid=avoid)
+            runway = self._densify([runway_start, approach_xy])
+            route = route_to_runway + runway[1:]
+            options.append((self._path_len(route), route))
+        return min(options, key=lambda item: item[0])[1]
+
     # ---- commands (same signatures as WarehouseSim) --------------------- #
     def go_to(self, name: str, node: str) -> dict:
         if name not in FORKLIFTS:
@@ -218,8 +253,8 @@ class IsaacNavBackend:
         meta = PALLETS.get(pallet_id)
         if not meta:
             return {"ok": False, "error": f"unknown pallet {pallet_id}"}
-        wpts = self._route_approach(self._fk_pos(name), meta["xy"],
-                                    avoid=self._blocked_by_others(name))
+        wpts = self._route_pick(self._fk_pos(name), meta["xy"],
+                                avoid=self._blocked_by_others(name))
         leg = Leg(action="pick", target=pallet_id, waypoints=wpts, pallet_path=meta["path"])
         self.bus.send_mission(name, [leg])
         return {"ok": True, "route": self._route_ids(wpts)}
@@ -263,10 +298,10 @@ class IsaacNavBackend:
                 meta = PALLETS.get(target)
                 if not meta:
                     return {"ok": False, "error": f"unknown pallet {target}"}
-                wpts = self._route_approach(cur, meta["xy"], avoid=avoid)
+                wpts = self._route_pick(cur, meta["xy"], avoid=avoid)
                 legs.append(Leg(action="pick", target=target, waypoints=wpts,
                                 pallet_path=meta["path"]))
-                cur = meta["xy"]
+                cur = wpts[-1] if wpts else cur
             elif kind == "drop":
                 z = ZONES.get(target)
                 if not z:
